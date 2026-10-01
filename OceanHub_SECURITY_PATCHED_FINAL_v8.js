@@ -1,7 +1,7 @@
 var __defProp = Object.defineProperty;
 var __name = (target, value) => __defProp(target, "name", { value, configurable: true });
 
-// OceanHub_SECURITY_PATCHED_FINAL_v8.js
+// OceanHub_SECURITY_PATCHED_FINAL_v10.js
 var RATE_LIMIT_MAX = 30;
 var RATE_LIMIT_WINDOW = 3600;
 var VALID_CACHE_TTL = 3600;
@@ -3268,6 +3268,407 @@ async function capturePayPalOrder(env, orderId) {
   return await response.json();
 }
 __name(capturePayPalOrder, "capturePayPalOrder");
+// ==================================================
+// [ AIR FLOW — OCEAN HUB AI ]
+// Gemini principal + OpenRouter respaldo
+// ==================================================
+const AIR_FLOW_MAX_MESSAGES = 12;
+const AIR_FLOW_MAX_MESSAGE_CHARS = 6000;
+const AIR_FLOW_MAX_TOTAL_CHARS = 30000;
+const AIR_FLOW_RATE_LIMIT = 20;
+const AIR_FLOW_RATE_WINDOW = 60;
+const AIR_FLOW_HISTORY_LIMIT = 20;
+const AIR_FLOW_MAX_IMAGE_BYTES = 3000000;
+
+const AIR_FLOW_MODE_PROMPTS = {
+  General: `Eres Air Flow, el asistente de IA integrado en Ocean Hub. Responde principalmente en español, con tono amigable, claro y natural. No inventes acciones que no realizaste. No reveles claves, contraseñas, tokens, secretos, sesiones ni datos privados.`,
+  Programación: `Eres Air Flow, especialista en programación dentro de Ocean Hub. Ayuda con JavaScript, HTML, CSS, Cloudflare Workers, APIs y Roblox Lua. Da código seguro, claro y explicado. No inventes que ejecutaste o desplegaste código si no lo hiciste. Nunca reveles secretos ni credenciales.`,
+  "Ocean Hub": `Eres Air Flow, el asistente integrado de Ocean Hub. Puedes explicar las funciones públicas de Ocean Hub, sus secciones y el uso general de la plataforma. No tienes permiso para revelar secretos, claves API, contraseñas, tokens, sesiones ni información privada de otros usuarios.`,
+  Estudio: `Eres Air Flow en modo Estudio. Explica temas paso a paso con lenguaje apropiado para estudiantes, ejemplos sencillos y respuestas claras. No reveles secretos ni datos privados.`
+};
+
+function airFlowSafeMode(mode) {
+  return AIR_FLOW_MODE_PROMPTS[mode] ? mode : "General";
+}
+
+function airFlowNormalizeMessages(messages) {
+  if (!Array.isArray(messages)) return [];
+  return messages.slice(-AIR_FLOW_MAX_MESSAGES).map((m) => ({
+    role: m?.role === "assistant" ? "assistant" : "user",
+    content: String(m?.content || "").slice(0, AIR_FLOW_MAX_MESSAGE_CHARS)
+  })).filter((m) => m.content.trim());
+}
+
+async function airFlowHistoryKey(email) {
+  return `airflow_history_${await hashKey(email)}`;
+}
+
+async function getAirFlowHistory(env, email) {
+  try {
+    const history = await env.STATS.get(await airFlowHistoryKey(email), "json");
+    return Array.isArray(history) ? history.slice(0, AIR_FLOW_HISTORY_LIMIT) : [];
+  } catch {
+    return [];
+  }
+}
+
+async function saveAirFlowConversation(env, email, conversation) {
+  return await withKVLock(env, `airflow_history:${email}`, async () => {
+    const all = await getAirFlowHistory(env, email);
+    const idx = all.findIndex((c) => c.id === conversation.id);
+    const cleanMessages = airFlowNormalizeMessages(conversation.messages).map((m) => ({ role: m.role, content: m.content }));
+    const item = {
+      id: String(conversation.id || generateRandomHex(12)).slice(0, 80),
+      title: String(conversation.title || "Nueva conversación").slice(0, 100),
+      mode: airFlowSafeMode(conversation.mode),
+      updatedAt: new Date().toISOString(),
+      messages: cleanMessages
+    };
+    if (idx >= 0) all.splice(idx, 1);
+    all.unshift(item);
+    while (all.length > AIR_FLOW_HISTORY_LIMIT) all.pop();
+    await env.STATS.put(await airFlowHistoryKey(email), JSON.stringify(all));
+    return item;
+  });
+}
+
+async function checkAirFlowRateLimit(env, request, email) {
+  const ip = getClientIP(request) || "unknown";
+  const now = Math.floor(Date.now() / 1000);
+  const bucket = Math.floor(now / AIR_FLOW_RATE_WINDOW);
+  const rawKey = `airflow_rl_${email}_${ip}_${bucket}`;
+  return await withKVLock(env, `airflow_rl:${email}:${ip}:${bucket}`, async () => {
+    const current = Number(await env.STATS.get(rawKey) || "0");
+    if (current >= AIR_FLOW_RATE_LIMIT) return false;
+    await env.STATS.put(rawKey, String(current + 1), { expirationTtl: AIR_FLOW_RATE_WINDOW + 10 });
+    return true;
+  });
+}
+
+function airFlowNormalizeAttachments(attachments) {
+  if (!Array.isArray(attachments)) return [];
+  return attachments.slice(0, 2).map((a) => ({
+    type: a?.type === "image" ? "image" : "file",
+    name: String(a?.name || "archivo").slice(0, 120),
+    mimeType: String(a?.mimeType || "application/octet-stream").slice(0, 100),
+    data: String(a?.data || "").slice(0, 4500000),
+    content: String(a?.content || "").slice(0, 12000)
+  })).filter((a) => a.data || a.content);
+}
+
+function airFlowBuildGeminiContents(messages, attachments) {
+  const clean = airFlowNormalizeMessages(messages);
+  const result = clean.map(airFlowMessageToGemini);
+  const images = airFlowNormalizeAttachments(attachments).filter((a) => a.type === "image" && a.data.startsWith("data:image/"));
+  const lastUser = [...result].reverse().find((m) => m.role === "user");
+  if (lastUser && images.length) {
+    for (const image of images) {
+      const comma = image.data.indexOf(",");
+      if (comma > 0) {
+        lastUser.parts.push({ inlineData: { mimeType: image.mimeType || image.data.slice(5, comma).split(";")[0], data: image.data.slice(comma + 1) } });
+      }
+    }
+  }
+  return result;
+}
+
+function airFlowBuildOpenRouterMessages(messages, attachments) {
+  const clean = airFlowNormalizeMessages(messages);
+  const result = clean.map(airFlowOpenRouterMessage);
+  const images = airFlowNormalizeAttachments(attachments).filter((a) => a.type === "image" && a.data.startsWith("data:image/"));
+  const lastUser = [...result].reverse().find((m) => m.role === "user");
+  if (lastUser && images.length) {
+    const text = String(lastUser.content || "");
+    lastUser.content = [{ type: "text", text }, ...images.map((image) => ({ type: "image_url", image_url: { url: image.data } }))];
+  }
+  return result;
+}
+
+function airFlowMessageToGemini(message) {
+  return {
+    role: message.role === "assistant" ? "model" : "user",
+    parts: [{ text: message.content }]
+  };
+}
+
+async function callGeminiAirFlow(env, messages, mode, attachments = []) {
+  if (!env.GEMINI_API_KEY) throw new Error("GEMINI_NOT_CONFIGURED");
+  const model = String(env.GEMINI_MODEL || "gemini-3.8-flash").trim();
+  const contents = airFlowBuildGeminiContents(messages, attachments);
+  const response = await fetch(`https://generativelanguage.googleapis.com/v1beta/models/${encodeURIComponent(model)}:generateContent`, {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+      "x-goog-api-key": env.GEMINI_API_KEY
+    },
+    body: JSON.stringify({
+      systemInstruction: { parts: [{ text: AIR_FLOW_MODE_PROMPTS[airFlowSafeMode(mode)] }] },
+      contents,
+      generationConfig: {
+        temperature: 0.7,
+        maxOutputTokens: 1600
+      }
+    })
+  });
+  if (!response.ok) {
+    throw new Error(`GEMINI_HTTP_${response.status}`);
+  }
+  const data = await response.json();
+  const text = data?.candidates?.[0]?.content?.parts?.map((p) => p?.text || "").join("").trim();
+  if (!text) throw new Error("GEMINI_EMPTY_RESPONSE");
+  return { text, provider: "Gemini", model };
+}
+
+function airFlowOpenRouterMessage(message) {
+  return { role: message.role, content: message.content };
+}
+
+async function callOpenRouterAirFlow(env, messages, mode, attachments = []) {
+  if (!env.OPENROUTER_API_KEY) throw new Error("OPENROUTER_NOT_CONFIGURED");
+  const model = String(env.OPENROUTER_MODEL || "openrouter/free").trim();
+  const system = { role: "system", content: AIR_FLOW_MODE_PROMPTS[airFlowSafeMode(mode)] };
+  const clean = airFlowBuildOpenRouterMessages(messages, attachments);
+  const response = await fetch("https://openrouter.ai/api/v1/chat/completions", {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+      "Authorization": `Bearer ${env.OPENROUTER_API_KEY}`,
+      ...(env.BASE_URL ? { "HTTP-Referer": String(env.BASE_URL) } : {}),
+      "X-Title": "Ocean Hub - Air Flow"
+    },
+    body: JSON.stringify({
+      model,
+      messages: [system, ...clean],
+      temperature: 0.7,
+      max_tokens: 1600
+    })
+  });
+  if (!response.ok) {
+    throw new Error(`OPENROUTER_HTTP_${response.status}`);
+  }
+  const data = await response.json();
+  const content = data?.choices?.[0]?.message?.content;
+  const text = Array.isArray(content)
+    ? content.map((part) => part?.text || "").join("").trim()
+    : String(content || "").trim();
+  if (!text) throw new Error("OPENROUTER_EMPTY_RESPONSE");
+  return { text, provider: "OpenRouter", model };
+}
+
+function airFlowTitleFromMessage(content) {
+  const cleaned = String(content || "").replace(/\s+/g, " ").trim();
+  if (!cleaned) return "Nueva conversación";
+  return cleaned.length > 48 ? `${cleaned.slice(0, 48)}…` : cleaned;
+}
+
+async function handleAirFlow(env, request) {
+  const auth = await requireAuth(env, request);
+  if (!auth) return Response.redirect(`${new URL(request.url).origin}/welcome`, 302);
+  const userName = escapeHTML(auth.user?.nombre || auth.user?.name || (auth.user?.email || "Usuario").split("@")[0]);
+  return new Response(`
+<!doctype html>
+<html lang="es">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
+<title>✨ Air Flow · Ocean Hub</title>
+<style>
+*{box-sizing:border-box}html,body{height:100%;margin:0}body{font-family:Inter,ui-sans-serif,system-ui,-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;background:#02050b;color:#eef7ff;overflow:hidden}.app{height:100%;display:flex;position:relative;background:radial-gradient(circle at 50% 15%,rgba(0,153,255,.11),transparent 34%),radial-gradient(circle at 50% 100%,rgba(89,34,255,.11),transparent 40%),#02050b}.glow{position:absolute;inset:auto -20% -30%;height:45%;background:radial-gradient(ellipse at 50% 0%,rgba(0,210,255,.12),transparent 60%),linear-gradient(180deg,transparent,rgba(0,130,255,.04));pointer-events:none}.sidebar{width:290px;border-right:1px solid rgba(120,170,255,.13);background:rgba(3,8,16,.82);backdrop-filter:blur(22px);display:flex;flex-direction:column;padding:18px;z-index:4}.brand{display:flex;align-items:center;gap:12px;margin-bottom:14px}.brand-logo{width:42px;height:42px;border-radius:50%;display:grid;place-items:center;background:radial-gradient(circle,#05111f 30%,#081b32 60%,#10102a 100%);border:1px solid #2a6bff;box-shadow:0 0 28px rgba(30,120,255,.35)}.brand-title{font-size:20px;font-weight:800}.brand-title span{background:linear-gradient(90deg,#63dfff,#785dff);-webkit-background-clip:text;background-clip:text;color:transparent}.new-chat{width:100%;border:1px solid rgba(87,132,255,.35);background:linear-gradient(135deg,rgba(30,91,255,.16),rgba(0,210,255,.08));color:#fff;border-radius:14px;padding:12px 14px;font-weight:700;cursor:pointer}.history{margin-top:18px;overflow:auto;display:flex;flex-direction:column;gap:8px}.history-item{border:1px solid transparent;background:rgba(255,255,255,.03);color:#b9cae0;border-radius:12px;padding:11px 12px;text-align:left;cursor:pointer}.history-item:hover,.history-item.active{border-color:rgba(80,170,255,.28);background:rgba(64,118,255,.09);color:#fff}.history-item small{display:block;margin-top:4px;opacity:.55;font-size:11px}.side-footer{margin-top:auto;color:#6f829f;font-size:11px;line-height:1.5}.main{min-width:0;flex:1;display:flex;flex-direction:column;position:relative}.topbar{height:74px;border-bottom:1px solid rgba(120,170,255,.10);display:flex;align-items:center;padding:0 20px;gap:14px;background:rgba(2,5,11,.58);backdrop-filter:blur(20px);z-index:3}.icon-btn{width:42px;height:42px;border-radius:12px;border:1px solid rgba(120,170,255,.15);background:rgba(255,255,255,.03);color:#dcecff;font-size:19px;cursor:pointer}.air-title{font-size:19px;font-weight:800}.air-title b{background:linear-gradient(90deg,#f7fbff 0%,#73e2ff 42%,#7d6aff 100%);-webkit-background-clip:text;background-clip:text;color:transparent}.air-subtitle{font-size:11px;color:#7890ad;margin-top:2px}.top-actions{margin-left:auto;display:flex;gap:8px;align-items:center}.status{padding:7px 10px;border:1px solid rgba(53,255,170,.16);color:#88ffc7;background:rgba(33,190,120,.06);border-radius:999px;font-size:11px}.hero{flex:1;min-height:0;position:relative;display:flex;flex-direction:column}.welcome{flex:1;display:flex;flex-direction:column;align-items:center;justify-content:center;padding:30px 24px 150px;text-align:center}.logo-ring{width:132px;height:132px;border-radius:50%;display:grid;place-items:center;position:relative;margin-bottom:24px;background:radial-gradient(circle,rgba(0,0,0,.96) 32%,rgba(31,88,255,.13) 56%,rgba(0,229,255,.08) 70%,transparent 72%);border:1px solid rgba(75,185,255,.40);box-shadow:0 0 50px rgba(36,148,255,.16),inset 0 0 40px rgba(90,70,255,.12);animation:float 5s ease-in-out infinite}.logo-mark{font-size:54px;filter:drop-shadow(0 0 17px rgba(0,206,255,.45))}.welcome h1{font-size:clamp(34px,5vw,60px);line-height:1.05;margin:0;font-weight:700;letter-spacing:-2px}.welcome h1 span{background:linear-gradient(90deg,#fff 0%,#7bdfff 48%,#8064ff 100%);-webkit-background-clip:text;background-clip:text;color:transparent}.tagline{margin:20px 0 28px;letter-spacing:5px;font-size:12px;color:#8aa7c8;font-weight:700}.suggestions{display:flex;flex-wrap:wrap;justify-content:center;gap:10px;max-width:900px}.suggestion{border:1px solid rgba(103,146,255,.22);background:rgba(255,255,255,.035);color:#b8c8df;border-radius:999px;padding:10px 14px;cursor:pointer}.suggestion:hover{border-color:#3d8fff;color:#fff;background:rgba(61,143,255,.08)}.chat{flex:1;overflow:auto;padding:34px 22px 180px;display:none}.message-wrap{max-width:930px;margin:0 auto 20px;display:flex;gap:12px}.message-wrap.user{justify-content:flex-end}.bubble{max-width:min(82%,760px);padding:14px 16px;border-radius:18px;line-height:1.55;white-space:pre-wrap;overflow-wrap:anywhere}.assistant .bubble{background:rgba(13,25,43,.86);border:1px solid rgba(89,145,255,.13);box-shadow:0 10px 35px rgba(0,0,0,.16)}.user .bubble{background:linear-gradient(135deg,#1646c8,#31308f);border:1px solid rgba(130,175,255,.25)}.avatar{width:34px;height:34px;border-radius:50%;display:grid;place-items:center;flex:0 0 34px;background:radial-gradient(circle,#0d1f38,#0a0922);border:1px solid rgba(70,161,255,.32)}.msg-tools{display:flex;gap:6px;margin-top:8px}.msg-tools button{border:0;background:transparent;color:#6f85a1;font-size:12px;cursor:pointer;padding:2px 4px}.msg-tools button:hover{color:#fff}.code{position:relative;background:#050a12;border:1px solid rgba(93,139,255,.16);border-radius:12px;padding:14px;margin:10px 0;overflow:auto;font-family:ui-monospace,SFMono-Regular,Menlo,monospace;font-size:13px}.code button{position:absolute;top:8px;right:8px;border:1px solid rgba(130,170,255,.18);background:#0d1624;color:#dce8ff;border-radius:8px;padding:5px 8px;cursor:pointer}.input-dock{position:absolute;left:0;right:0;bottom:0;padding:20px 20px 24px;background:linear-gradient(180deg,transparent 0%,rgba(2,5,11,.72) 24%,rgba(2,5,11,.97) 55%);z-index:3}.input-shell{max-width:980px;margin:0 auto;display:flex;align-items:center;gap:10px;padding:9px 10px 9px 14px;border-radius:28px;border:1px solid rgba(89,121,255,.54);background:rgba(7,13,25,.92);box-shadow:0 0 34px rgba(44,84,255,.10),inset 0 0 35px rgba(16,40,70,.16)}.input-shell textarea{flex:1;resize:none;max-height:150px;min-height:46px;border:0;outline:0;background:transparent;color:#fff;font:inherit;padding:12px 2px}.input-shell textarea::placeholder{color:#6c7f98}.round{width:46px;height:46px;border-radius:50%;border:1px solid rgba(92,139,255,.30);background:#0a1424;color:#ddecff;cursor:pointer;font-size:18px}.send{background:radial-gradient(circle at 35% 30%,#36e7ff,#244aff 52%,#10132c);box-shadow:0 0 28px rgba(37,100,255,.35);font-size:20px}.send:disabled{opacity:.5;cursor:default}.bottom-note{text-align:center;color:#58708e;font-size:10px;margin-top:8px}.thinking{display:inline-flex;gap:4px;align-items:center}.thinking i{width:6px;height:6px;border-radius:50%;background:#79dfff;animation:pulse 1s infinite}.thinking i:nth-child(2){animation-delay:.16s}.thinking i:nth-child(3){animation-delay:.32s}.overlay{display:none;position:absolute;inset:0;background:rgba(0,0,0,.52);z-index:5}.mode-menu{position:absolute;top:64px;left:20px;background:#07101c;border:1px solid rgba(89,145,255,.18);border-radius:15px;min-width:210px;padding:8px;box-shadow:0 20px 60px rgba(0,0,0,.45);display:none;z-index:8}.mode-menu button{display:block;width:100%;text-align:left;padding:10px 12px;border:0;background:transparent;color:#b6c7df;border-radius:10px;cursor:pointer}.mode-menu button:hover,.mode-menu button.active{background:rgba(70,127,255,.11);color:#fff}.empty-history{padding:14px;color:#637a97;font-size:12px;text-align:center}.mobile-side{display:none}@keyframes float{0%,100%{transform:translateY(0)}50%{transform:translateY(-8px)}}@keyframes pulse{0%,80%,100%{transform:scale(.65);opacity:.4}40%{transform:scale(1);opacity:1}}@media(max-width:800px){.sidebar{position:absolute;left:0;top:0;bottom:0;transform:translateX(-102%);transition:.25s;width:290px;box-shadow:30px 0 60px rgba(0,0,0,.45)}.sidebar.open{transform:translateX(0)}.overlay.show{display:block}.topbar{padding:0 12px}.status{display:none}.welcome{padding:15px 18px 155px}.welcome h1{letter-spacing:-1px}.logo-ring{width:112px;height:112px}.logo-mark{font-size:45px}.tagline{letter-spacing:3px}.suggestion{font-size:12px}.bubble{max-width:90%}.chat{padding-left:12px;padding-right:12px}.input-dock{padding:14px 10px 16px}.input-shell{padding-left:10px}.side-footer{padding-bottom:20px}}
+</style>
+</head>
+<body>
+<div class="app">
+  <div class="glow"></div>
+  <div class="overlay" id="overlay"></div>
+  <aside class="sidebar" id="sidebar">
+    <div class="brand"><div class="brand-logo">✦</div><div><div class="brand-title">Air <span>Flow</span></div><div style="font-size:11px;color:#6983a3">Ocean Hub AI</div></div></div>
+    <button class="new-chat" id="newChat">＋ Nuevo chat</button>
+    <div class="history" id="history"><div class="empty-history">Tus conversaciones aparecerán aquí.</div></div>
+    <div class="side-footer">Las respuestas de IA pueden contener errores. No compartas datos sensibles.</div>
+  </aside>
+  <main class="main">
+    <div class="topbar">
+      <button class="icon-btn" id="menuBtn" aria-label="Menú">☰</button>
+      <div style="position:relative"><button class="icon-btn" id="modeBtn" aria-label="Modo">✦</button><div class="mode-menu" id="modeMenu">
+        <button data-mode="General" class="active">🌊 General</button>
+        <button data-mode="Programación">💻 Programación</button>
+        <button data-mode="Ocean Hub">🌊 Ocean Hub</button>
+        <button data-mode="Estudio">📚 Estudio</button>
+      </div></div>
+      <div><div class="air-title">Air <b>Flow</b></div><div class="air-subtitle" id="modeLabel">Tu asistente de IA · General</div></div>
+      <div class="top-actions"><div class="status" id="status">● Conectando</div><button class="icon-btn" id="homeBtn" title="Volver a Ocean Hub">⌂</button></div>
+    </div>
+    <section class="hero">
+      <div class="welcome" id="welcome">
+        <div class="logo-ring"><div class="logo-mark">➤</div></div>
+        <h1>Pregunta lo que quieras, <span>${userName}</span></h1>
+        <div class="tagline">TU DESTINO. TU RITMO. TU AIR FLOW.</div>
+        <div class="suggestions">
+          <button class="suggestion">💡 Dame una idea para mi proyecto</button>
+          <button class="suggestion">💻 Ayúdame con código</button>
+          <button class="suggestion">🌊 ¿Qué puedo hacer en Ocean Hub?</button>
+          <button class="suggestion">📚 Explícame algo fácil</button>
+        </div>
+      </div>
+      <div class="chat" id="chat"></div>
+      <div class="input-dock">
+        <div class="input-shell">
+          <input id="fileInput" type="file" accept="image/*,.txt,.md,.json,.js,.html,.css,.lua" hidden>
+          <button class="round" id="attachBtn" title="Adjuntar archivo">＋</button>
+          <textarea id="input" rows="1" placeholder="Pregunta lo que quieras..."></textarea>
+          <button class="round" id="micBtn" title="Voz">🎤</button>
+          <button class="round send" id="sendBtn" title="Enviar">✦</button>
+        </div>
+        <div class="bottom-note">Air Flow usa Gemini y OpenRouter desde el servidor de Ocean Hub. Nunca compartas contraseñas ni claves.</div>
+      </div>
+    </section>
+  </main>
+</div>
+<script>
+(() => {
+  const state = { messages: [], mode: 'General', conversationId: crypto.randomUUID ? crypto.randomUUID() : String(Date.now()), attached: null, sending: false };
+  const el = (id) => document.getElementById(id);
+  const welcome = el('welcome'), chat = el('chat'), input = el('input'), sendBtn = el('sendBtn'), history = el('history'), sidebar = el('sidebar'), overlay = el('overlay'), status = el('status'), modeBtn = el('modeBtn'), modeMenu = el('modeMenu'), modeLabel = el('modeLabel');
+  const escapeHtml = (s) => String(s ?? '').replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+  const renderText = (s) => {
+    const escaped = escapeHtml(s);
+const fence = String.fromCharCode(96).repeat(3);
+    const fencedRe = new RegExp(fence + '([\\s\\S]*?)' + fence, 'g');
+    return escaped.replace(fencedRe, (_, code) => '<div class="code"><button data-copy="' + encodeURIComponent(code) + '">📋 Copiar</button><pre>' + code + '</pre></div>').replace(/\n/g, '<br>');
+  };
+  function openChat(){welcome.style.display='none';chat.style.display='block'}
+  function closeSide(){sidebar.classList.remove('open');overlay.classList.remove('show')}
+  function scrollChat(){chat.scrollTop=chat.scrollHeight}
+  function addMessage(role, content, opts={}){
+    openChat();
+    const wrap=document.createElement('div');wrap.className='message-wrap ' + role;
+    const avatar=role==='assistant'?'<div class="avatar">✦</div>':'';
+    const bubble=document.createElement('div');bubble.className='bubble';bubble.innerHTML=renderText(content);
+    wrap.innerHTML=role==='assistant'?avatar+'<div><div class="bubble"></div><div class="msg-tools"><button data-action="copy">📋 Copiar</button><button data-action="speak">🔊 Leer</button><button data-action="regen">🔄 Regenerar</button></div></div>':'<div class="bubble"></div>';
+    wrap.querySelector('.bubble').innerHTML=renderText(content);
+    wrap.dataset.index=String(state.messages.length);
+    if(opts.thinking){wrap.querySelector('.bubble').innerHTML='<span class="thinking"><i></i><i></i><i></i></span>';}
+    chat.appendChild(wrap);scrollChat();return wrap;
+  }
+  async function loadHistory(){
+    try{const r=await fetch('/air-flow/api/history');const d=await r.json();history.innerHTML='';if(!Array.isArray(d.history)||!d.history.length){history.innerHTML='<div class="empty-history">Tus conversaciones aparecerán aquí.</div>';return}d.history.forEach(item=>{const b=document.createElement('button');b.className='history-item';b.innerHTML=escapeHtml(item.title)+'<small>'+escapeHtml(item.mode || 'General')+'</small>';b.onclick=()=>openConversation(item);history.appendChild(b)})}catch{history.innerHTML='<div class="empty-history">No se pudo cargar el historial.</div>'}}
+  function resetChat(){state.messages=[];state.conversationId=crypto.randomUUID?crypto.randomUUID():String(Date.now());state.attached=null;chat.innerHTML='';welcome.style.display='flex';chat.style.display='none';input.value='';input.placeholder='Pregunta lo que quieras...';closeSide()}
+  function openConversation(item){state.messages=Array.isArray(item.messages)?item.messages.slice(-12):[];state.conversationId=item.id || (crypto.randomUUID?crypto.randomUUID():String(Date.now()));state.mode=item.mode || 'General';setMode(state.mode);chat.innerHTML='';state.messages.forEach(m=>addMessage(m.role,m.content));openChat();closeSide()}
+  function setMode(mode){state.mode=mode;modeLabel.textContent='Tu asistente de IA · '+mode;modeMenu.querySelectorAll('button').forEach(b=>b.classList.toggle('active',b.dataset.mode===mode));modeMenu.style.display='none'}
+  async function health(){try{const r=await fetch('/air-flow/api/health');const d=await r.json();if(d.gemini||d.openrouter){status.textContent='● Air Flow Online';status.style.color='#88ffc7'}else{status.textContent='● IA no configurada';status.style.color='#ffbf69'}}catch{status.textContent='● Estado desconocido'}}
+  async function requestAnswer(){
+    state.sending=true;sendBtn.disabled=true;
+    const thinking=addMessage('assistant','',{thinking:true});
+    try{
+      const attachments=state.attached ? [state.attached] : [];
+      const r=await fetch('/air-flow/api/chat',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({conversationId:state.conversationId,mode:state.mode,messages:state.messages,attachments})});
+      const d=await r.json();
+      if(!r.ok) throw new Error(d.error || 'No se pudo completar la solicitud');
+      thinking.querySelector('.bubble').innerHTML=renderText(d.text||'No recibí una respuesta.');
+      state.messages.push({role:'assistant',content:d.text||''});
+      status.textContent='● '+(d.provider || 'Air Flow')+' Online';
+      scrollChat();loadHistory();
+    }catch(e){thinking.querySelector('.bubble').innerHTML=escapeHtml(e.message || 'No se pudo completar la solicitud.');}
+    finally{state.attached=null;state.sending=false;sendBtn.disabled=false;input.placeholder='Pregunta lo que quieras...';scrollChat()}
+  }
+  async function send(){
+    const text=input.value.trim(); if(!text || state.sending)return;
+    const payloadText=state.attached?.type==='file' ? text+'\n\n[Archivo adjunto: '+state.attached.name+']\n'+state.attached.content : text;
+    const displayText=state.attached?.type==='image' ? text+'\n\n[Imagen adjunta: '+state.attached.name+']' : payloadText;
+    state.messages.push({role:'user',content:displayText});
+    addMessage('user',displayText);input.value='';input.style.height='auto';
+    await requestAnswer();
+  }
+  function fillSuggestion(text){input.value=text;input.focus();input.dispatchEvent(new Event('input'))}
+  el('menuBtn').onclick=()=>{sidebar.classList.add('open');overlay.classList.add('show')};overlay.onclick=closeSide;el('newChat').onclick=resetChat;el('homeBtn').onclick=()=>location.href='/home';modeBtn.onclick=()=>{modeMenu.style.display=modeMenu.style.display==='block'?'none':'block'};
+  modeMenu.querySelectorAll('button').forEach(b=>b.onclick=()=>setMode(b.dataset.mode));
+  document.querySelectorAll('.suggestion').forEach(b=>b.onclick=()=>fillSuggestion(b.textContent.replace(/^\S+\s/,'').trim()));
+  sendBtn.onclick=send;
+  input.addEventListener('keydown',e=>{if(e.key==='Enter'&&!e.shiftKey){e.preventDefault();send()}});
+  input.addEventListener('input',()=>{input.style.height='auto';input.style.height=Math.min(input.scrollHeight,150)+'px'});
+  el('attachBtn').onclick=()=>el('fileInput').click();
+  el('fileInput').onchange=async e=>{const file=e.target.files?.[0];if(!file)return;if(file.size>3000000){alert('El archivo supera 3 MB.');e.target.value='';return}if(file.type.startsWith('image/')){const reader=new FileReader();reader.onload=()=>{state.attached={type:'image',name:file.name,mimeType:file.type,data:String(reader.result)};input.placeholder='Describe qué quieres analizar de la imagen...';};reader.readAsDataURL(file)}else{const text=await file.text();state.attached={type:'file',name:file.name,mimeType:file.type || 'text/plain',content:text.slice(0,12000)};input.placeholder='Escribe qué quieres hacer con el archivo...'}};
+  el('micBtn').onclick=()=>{const SR=window.SpeechRecognition||window.webkitSpeechRecognition;if(!SR){alert('El reconocimiento de voz no está disponible en este navegador.');return}const rec=new SR();rec.lang='es-ES';rec.interimResults=false;rec.onresult=e=>{input.value=(input.value+' '+e.results[0][0].transcript).trim();input.dispatchEvent(new Event('input'));};rec.start()};
+  chat.addEventListener('click',async e=>{const copy=e.target.closest('[data-action="copy"],[data-copy]');if(copy){let text='';if(copy.dataset.copy)text=decodeURIComponent(copy.dataset.copy);else{text=copy.parentElement.parentElement.querySelector('.bubble')?.innerText||''}try{await navigator.clipboard.writeText(text);copy.textContent='✓ Copiado';setTimeout(()=>copy.textContent='📋 Copiar',1200)}catch{}}const speak=e.target.closest('[data-action="speak"]');if(speak){const box=speak.parentElement.previousElementSibling;if(box&&('speechSynthesis' in window)){speechSynthesis.cancel();speechSynthesis.speak(new SpeechSynthesisUtterance(box.innerText))}}const regen=e.target.closest('[data-action="regen"]');if(regen&&!state.sending){const idx=[...chat.querySelectorAll('.message-wrap')].indexOf(regen.closest('.message-wrap'));if(idx>=0&&state.messages[idx]?.role==='assistant'){state.messages=state.messages.slice(0,idx);chat.innerHTML='';state.messages.forEach(m=>addMessage(m.role,m.content));await requestAnswer()}}});
+  loadHistory();health();
+})();
+</script>
+</body>
+</html>`, { status: 200, headers: { "Content-Type": "text/html; charset=UTF-8" } });
+}
+
+async function handleAirFlowChat(env, request) {
+  const auth = await requireAuth(env, request);
+  if (!auth) return jsonResponse({ error: "No autorizado" }, 401);
+  if (request.method !== "POST") return jsonResponse({ error: "Método no permitido" }, 405);
+  if (!(await checkAirFlowRateLimit(env, request, auth.user.email))) {
+    return jsonResponse({ error: "Has enviado demasiados mensajes. Espera un momento y vuelve a intentarlo." }, 429);
+  }
+  let body;
+  try { body = await request.json(); } catch { return jsonResponse({ error: "Solicitud inválida" }, 400); }
+  const mode = airFlowSafeMode(body?.mode);
+  const messages = airFlowNormalizeMessages(body?.messages);
+  const attachments = airFlowNormalizeAttachments(body?.attachments);
+  const serialized = JSON.stringify({ messages, attachments });
+  if (!messages.length) return jsonResponse({ error: "Escribe un mensaje primero." }, 400);
+  if (serialized.length > AIR_FLOW_MAX_TOTAL_CHARS + 4600000) return jsonResponse({ error: "La solicitud es demasiado grande. Usa un archivo más pequeño." }, 413);
+  for (const attachment of attachments) {
+    if (attachment.type === "image") {
+      if (!attachment.data.startsWith("data:image/")) return jsonResponse({ error: "Imagen adjunta inválida." }, 400);
+      if (attachment.data.length > 4300000) return jsonResponse({ error: "La imagen es demasiado grande." }, 413);
+    } else if (attachment.content.length > 12000) {
+      return jsonResponse({ error: "El archivo de texto es demasiado grande." }, 413);
+    }
+  }
+
+  let result = null;
+  let providerError = null;
+  try {
+    result = await callGeminiAirFlow(env, messages, mode, attachments);
+  } catch (e) {
+    providerError = String(e?.message || "Gemini error").slice(0, 120);
+    try {
+      result = await callOpenRouterAirFlow(env, messages, mode, attachments);
+    } catch (fallbackError) {
+      console.error("Air Flow providers unavailable", { primary: providerError, fallback: String(fallbackError?.message || "OpenRouter error").slice(0, 120) });
+      return jsonResponse({ error: "Air Flow no está disponible ahora mismo. Revisa la configuración de tus proveedores de IA." }, 503);
+    }
+  }
+
+  const conversationId = String(body?.conversationId || generateRandomHex(12)).slice(0, 80);
+  const firstUser = messages.find((m) => m.role === "user");
+  try {
+    await saveAirFlowConversation(env, auth.user.email, {
+      id: conversationId,
+      title: airFlowTitleFromMessage(firstUser?.content || "Nueva conversación"),
+      mode,
+      messages: [...messages, { role: "assistant", content: result.text }]
+    });
+  } catch (e) {
+    console.error("Air Flow history save failed", String(e?.message || e).slice(0, 160));
+  }
+  return jsonResponse({ text: result.text, provider: result.provider, model: result.model });
+}
+
+async function handleAirFlowHistory(env, request) {
+  const auth = await requireAuth(env, request);
+  if (!auth) return jsonResponse({ error: "No autorizado" }, 401);
+  const history = await getAirFlowHistory(env, auth.user.email);
+  return jsonResponse({ history: history.map((item) => ({ id: item.id, title: item.title, mode: item.mode, updatedAt: item.updatedAt, messages: item.messages })) });
+}
+
+async function handleAirFlowHealth(env, request) {
+  const auth = await requireAuth(env, request);
+  if (!auth) return jsonResponse({ error: "No autorizado" }, 401);
+  return jsonResponse({
+    online: Boolean(env.GEMINI_API_KEY || env.OPENROUTER_API_KEY),
+    gemini: Boolean(env.GEMINI_API_KEY),
+    openrouter: Boolean(env.OPENROUTER_API_KEY),
+    geminiModel: String(env.GEMINI_MODEL || "gemini-3.8-flash"),
+    openrouterModel: String(env.OPENROUTER_MODEL || "openrouter/free")
+  });
+}
+
 async function handleHome(env) {
   const stats = await getStats(env) || {};
   const dynamicKeys = await getDynamicKeys(env) || {};
@@ -3304,6 +3705,8 @@ async function handleHome(env) {
         .card { background: rgba(255,255,255,0.08); border-radius: 30px; padding: 30px; width: 200px; text-align: center; border: 1px solid rgba(0,200,255,0.2); transition: 0.3s; }
         .card:hover { transform: scale(1.05); box-shadow: 0 0 40px rgba(0,200,255,0.2); }
         .card a { color: #00ccff; text-decoration: none; font-size: 1.5rem; font-weight: bold; }
+        .air-flow-card { border-color: rgba(100,120,255,0.45); background: linear-gradient(145deg, rgba(33,77,190,0.15), rgba(100,55,220,0.08)); }
+        .air-flow-card a { background: linear-gradient(90deg,#70e7ff,#7e6cff); -webkit-background-clip:text; background-clip:text; color:transparent; }
         .card p { color: #88aacc; margin-top: 10px; }
         .user-actions { margin-top: 20px; display: flex; gap: 15px; }
         .user-actions a { color: #00ccff; text-decoration: none; font-weight: bold; }
@@ -3335,6 +3738,7 @@ async function handleHome(env) {
             <div class="card"><a href="/claim-key">\u{1F3AB} Canjear</a><p>Canjea tu c\xF3digo</p></div>
             <div class="card"><a href="/suscribirse">\u{1F4C5} Suscripci\xF3n</a><p>Planes mensuales</p></div>
             <div class="card"><a href="/leaderboard">\u{1F3C6} Ranking</a><p>Top usuarios</p></div>
+            <div class="card air-flow-card"><a href="/air-flow">\u2728 Air Flow</a><p>Tu asistente de IA</p></div>
         </div>
         <div class="user-actions">
             <a href="/profile">Mi perfil</a>
@@ -6129,6 +6533,10 @@ async function workerFetch(request, env) {
   }
   if (path === "/welcome") return await handleWelcome(env, request);
   if (path === "/" || path === "/home") return await handleHome(env);
+  if (path === "/air-flow") return await handleAirFlow(env, request);
+  if (path === "/air-flow/api/chat") return await handleAirFlowChat(env, request);
+  if (path === "/air-flow/api/history") return await handleAirFlowHistory(env, request);
+  if (path === "/air-flow/api/health") return await handleAirFlowHealth(env, request);
   if (path === "/shop") return await handleShop(env, request);
   if (path === "/pay") return await handlePay();
   if (path === "/sell") return await handleSell(env, request);
@@ -6293,4 +6701,4 @@ export {
   OceanHub_SECURITY_PATCHED_FINAL_v8_default as default,
   workerFetch
 };
-//# sourceMappingURL=OceanHub_SECURITY_PATCHED_FINAL_v8.js.map
+//# sourceMappingURL=OceanHub_SECURITY_PATCHED_FINAL_v10.js.map
