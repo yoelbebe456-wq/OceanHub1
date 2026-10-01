@@ -3408,7 +3408,7 @@ const AIR_FLOW_MAX_HISTORY_MESSAGES = 12;
 const AIR_FLOW_MAX_HISTORY_CHARS = 24000;
 const AIR_FLOW_RATE_WINDOW = 60;
 const AIR_FLOW_RATE_MAX = 20;
-const AIR_FLOW_GEMINI_MODEL_DEFAULT = 'gemini-3.6-flash';
+const AIR_FLOW_GEMINI_MODEL_DEFAULT = 'gemini-3.8-flash';
 const AIR_FLOW_OPENROUTER_MODEL_DEFAULT = 'openrouter/free';
 
 const AIR_FLOW_SYSTEM_PROMPT = `You are Air Flow, the AI assistant inside Ocean Hub.
@@ -3518,10 +3518,9 @@ async function callAirFlowGemini(env, messages, mode) {
         body: JSON.stringify({
             systemInstruction: { parts: [{ text: systemInstruction }] },
             contents,
-            generationConfig: {
-                temperature: 0.7,
-                maxOutputTokens: 1200
-            }
+            generationConfig: (model === 'gemini-3.8-flash' || model.startsWith('gemini-3.8-flash-'))
+                ? { maxOutputTokens: 1200 }
+                : { temperature: 0.7, maxOutputTokens: 1200 }
         })
     });
     const data = await response.json().catch(() => ({}));
