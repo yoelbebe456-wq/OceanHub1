@@ -1,0 +1,29 @@
+{
+  "$schema": "./node_modules/wrangler/config-schema.json",
+  "name": "oceanhud",
+  "main": "OceanHub_SECURITY_PATCHED_FINAL_v8.js",
+  "compatibility_date": "2026-09-27",
+
+  "kv_namespaces": [
+    {
+      "binding": "STATS",
+      "id": "1cf0ffb0625b4852820af0696d71d6c5"
+    }
+  ],
+
+  "durable_objects": {
+    "bindings": [
+      {
+        "name": "KV_LOCKER",
+        "class_name": "KVLocker"
+      }
+    ]
+  },
+
+  "exports": {
+    "KVLocker": {
+      "type": "durable-object",
+      "storage": "sqlite"
+    }
+  }
+}
