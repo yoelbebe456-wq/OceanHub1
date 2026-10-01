@@ -6698,7 +6698,7 @@ var OceanHub_SECURITY_PATCHED_FINAL_v8_default = {
 };
 export {
   KVLocker,
-  OceanHub_SECURITY_PATCHED_FINAL_v8_default as default,
+  OceanHub_SECURITY_PATCHED_FINAL_v10_default as default,
   workerFetch
 };
 //# sourceMappingURL=OceanHub_SECURITY_PATCHED_FINAL_v10.js.map
