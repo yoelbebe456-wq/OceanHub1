@@ -4,6 +4,11 @@
   "main": "OceanHub_SECURITY_PATCHED_FINAL_v10.js",
   "compatibility_date": "2026-09-27",
 
+  "vars": {
+    "GEMINI_MODEL": "gemini-3.8-flash",
+    "OPENROUTER_MODEL": "openrouter/free"
+  },
+
   "kv_namespaces": [
     {
       "binding": "STATS",
