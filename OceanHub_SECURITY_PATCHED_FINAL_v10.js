@@ -3400,88 +3400,112 @@ async function capturePayPalOrder(env, orderId) {
 // ==================================================
 
 // ==================================================
-// [ AIR FLOW AI ]
+// [ ✈️ AIR FLOW — SERVER SUITE V11 ]
 // ==================================================
 
-const AIR_FLOW_MAX_MESSAGE_CHARS = 6000;
-const AIR_FLOW_MAX_HISTORY_MESSAGES = 12;
-const AIR_FLOW_MAX_HISTORY_CHARS = 24000;
-const AIR_FLOW_RATE_WINDOW = 60;
-const AIR_FLOW_RATE_MAX = 20;
-const AIR_FLOW_GEMINI_MODEL_DEFAULT = 'gemini-3.8-flash';
-const AIR_FLOW_OPENROUTER_MODEL_DEFAULT = 'openrouter/free';
+const AF_MAX_MESSAGE_CHARS = 6000;
+const AF_MAX_HISTORY_MESSAGES = 16;
+const AF_MAX_HISTORY_CHARS = 28000;
+const AF_MAX_UPLOAD_BYTES = 10 * 1024 * 1024;
+const AF_RATE_WINDOW = 60;
+const AF_RATE_MAX = 20;
+const AF_GEMINI_MODEL_DEFAULT = 'gemini-3.8-flash';
+const AF_OPENROUTER_MODEL_DEFAULT = 'openrouter/free';
+const AF_LIVE_MODEL_DEFAULT = 'gemini-3.8-live';
+const AF_IMAGE_MODEL_DEFAULT = 'gemini-3.1-flash-image';
+const AF_MEMORY_TTL = 60 * 60 * 24 * 365;
+const AF_MAX_MEMORIES = 100;
+const AF_MAX_CONVERSATIONS = 30;
+const AF_MAX_METRIC_KEYS = 48;
 
-const AIR_FLOW_SYSTEM_PROMPT = `You are Air Flow, the AI assistant inside Ocean Hub.
-Personality and communication rules:
-- Speak naturally, like a person, not a manual.
-- Get to the point. Simple question = concise answer.
-- Match the user's tone and language.
-- Be warm, energetic and playful when appropriate, but never force jokes or affection.
-- Admit uncertainty. Never invent facts, sources, tool actions or completed actions.
-- Do not repeat the user's question unnecessarily.
-- Ask a follow-up only when it is genuinely useful.
-- Keep answers useful and readable; use bullets when they improve clarity.
-- The user controls the conversation depth.
-- Do not claim access to private data, files, apps, web pages or actions unless the current system actually provides them.
-- Treat the following mode as a style hint, not as permission to perform unavailable tools.
+const AF_PERSONALITY = `You are Air Flow, the AI assistant built into Ocean Hub.
+PERSONALITY:
+- Energetic, warm, natural, confident and direct.
+- Be friendly and playful when it fits, never forced.
+- Prefer concise answers; do not add filler or repeat the question.
+- Match the user's language and tone.
+- Never invent facts, sources, actions, tool results or access.
+- State uncertainty clearly.
+- Do not reveal API keys, secrets, PINs, sessions or private data.
+- Never expose hidden reasoning or chain-of-thought.
+QUALITY FILTER:
+Before finalizing, check: direct answer, not too long, no repetition, natural tone, no invented claims.
+OCEAN HUB CONTEXT:
+Air Flow may use server-provided tools only when the request explicitly enables them.
+When web research is enabled, cite sources and distinguish sourced facts from inference.
+When a tool is unavailable, say so briefly and continue helpfully.`;
 
-Ocean Hub / Air Flow product modes: QUICK, THINK, RESEARCH, CODE, STUDY, GAMING, CREATE, TRAVEL, PLANNER.
-If a mode requires a tool that is not available in this chat endpoint, explain that briefly and still help with what you can do.`;
+const AF_MODE_RULES = {
+    QUICK: 'Be fast and concise.',
+    THINK: 'Reason carefully internally and provide only the useful conclusion and key steps.',
+    RESEARCH: 'Research current information, compare credible sources, identify uncertainty, and include concise source links.',
+    CODE: 'Act as a practical coding assistant. Prefer complete working snippets and point out concrete errors.',
+    STUDY: 'Teach clearly with simple explanations and examples. Avoid unnecessary complexity.',
+    GAMING: 'Focus on practical game development, Roblox, Unity or Unreal help.',
+    CREATE: 'Be creative and polished for visual, writing and product ideas.',
+    TRAVEL: 'Use current web information when enabled. Do not claim live availability or bookings you did not verify.',
+    PLANNER: 'Convert the request into a compact, actionable plan with clear steps.',
+    AGENT: 'Plan tasks as explicit steps. Require confirmation before any sensitive action.',
+    SHOPPING: 'Research current products and compare specifications and prices only when current data is available.',
+    SECURITY: 'Prioritize privacy, abuse prevention, permissions and auditability.',
+};
 
-function getAirFlowModeInstruction(mode) {
-    const modes = {
-        QUICK: 'Answer fast and briefly.',
-        THINK: 'Reason carefully and give a clear, structured answer. Do not expose hidden chain-of-thought.',
-        RESEARCH: 'Distinguish known information from uncertainty. This endpoint has no web-search tool, so do not pretend to have researched the web.',
-        CODE: 'Prioritize correct, practical code and explain only what is needed.',
-        STUDY: 'Teach clearly with simple examples and avoid overwhelming the learner.',
-        GAMING: 'Be practical and concise about games and game development.',
-        CREATE: 'Be creative and offer polished ideas while staying concise.',
-        TRAVEL: 'Give organized planning help, but do not claim live prices, availability or bookings.',
-        PLANNER: 'Turn the request into a simple actionable plan.'
-    };
-    return modes[String(mode || 'QUICK').toUpperCase()] || modes.QUICK;
+function afMode(mode) {
+    const m = String(mode || 'QUICK').toUpperCase().slice(0, 20);
+    return AF_MODE_RULES[m] ? m : 'QUICK';
 }
 
-function normalizeAirFlowHistory(history) {
-    if (!Array.isArray(history)) return [];
+function afNormalizeMessages(messages) {
+    if (!Array.isArray(messages)) return [];
     const out = [];
-    let totalChars = 0;
-    for (const item of history.slice(-AIR_FLOW_MAX_HISTORY_MESSAGES)) {
+    let total = 0;
+    for (const item of messages.slice(-AF_MAX_HISTORY_MESSAGES)) {
         if (!item || typeof item !== 'object') continue;
-        const role = item.role === 'assistant' ? 'assistant' : (item.role === 'user' ? 'user' : null);
+        const role = item.role === 'assistant' ? 'assistant' : item.role === 'user' ? 'user' : null;
         if (!role) continue;
-        const content = String(item.content || '').trim();
+        const content = String(item.content || '').trim().slice(0, 5000);
         if (!content) continue;
-        const clipped = content.slice(0, 5000);
-        if (totalChars + clipped.length > AIR_FLOW_MAX_HISTORY_CHARS) break;
-        out.push({ role, content: clipped });
-        totalChars += clipped.length;
+        if (total + content.length > AF_MAX_HISTORY_CHARS) break;
+        out.push({ role, content });
+        total += content.length;
     }
     return out;
 }
 
-async function checkAirFlowRateLimit(env, request, email) {
+function afQualityFilter(text) {
+    let out = String(text || '').replace(/\r\n/g, '\n').trim();
+    if (!out) return '';
+    const paragraphs = out.split(/\n{2,}/).map(x => x.trim()).filter(Boolean);
+    const seen = new Set();
+    const deduped = [];
+    for (const p of paragraphs) {
+        const key = p.toLowerCase().replace(/\s+/g, ' ').slice(0, 500);
+        if (!seen.has(key)) { seen.add(key); deduped.push(p); }
+    }
+    out = deduped.join('\n\n');
+    if (out.length > 12000) out = out.slice(0, 11980).trimEnd() + '…';
+    return out;
+}
+
+async function afRateLimit(env, request, email, bucket = 'chat') {
     const ip = getClientIP(request);
-    const safeEmail = String(email || 'anonymous').toLowerCase().trim();
-    const key = await hashKey(`${ip}:${safeEmail}`);
-    return await withKVLock(env, `airflow_rl:${key}`, async () => {
-        const kvKey = `airflow_rl_${key}`;
+    const key = await hashKey(`${bucket}:${String(email || '').toLowerCase()}:${ip}`);
+    return await withKVLock(env, `af_rl:${bucket}:${key}`, async () => {
+        const kvKey = `af_rl_${bucket}_${key}`;
         const now = Math.floor(Date.now() / 1000);
         let record = await env.STATS.get(kvKey, 'json');
-        if (!record || now - Number(record.start || 0) >= AIR_FLOW_RATE_WINDOW) {
+        if (!record || now - Number(record.start || 0) >= AF_RATE_WINDOW) {
             record = { count: 1, start: now };
-            await env.STATS.put(kvKey, JSON.stringify(record), { expirationTtl: AIR_FLOW_RATE_WINDOW });
-            return true;
+        } else {
+            if (Number(record.count || 0) >= AF_RATE_MAX) return false;
+            record.count++;
         }
-        if (Number(record.count || 0) >= AIR_FLOW_RATE_MAX) return false;
-        record.count++;
-        await env.STATS.put(kvKey, JSON.stringify(record), { expirationTtl: AIR_FLOW_RATE_WINDOW });
+        await env.STATS.put(kvKey, JSON.stringify(record), { expirationTtl: AF_RATE_WINDOW + 5 });
         return true;
     });
 }
 
-function getAirFlowTextFromGemini(data) {
+function afExtractGeminiText(data) {
     const parts = [];
     for (const candidate of (data?.candidates || [])) {
         for (const part of (candidate?.content?.parts || [])) {
@@ -3491,159 +3515,791 @@ function getAirFlowTextFromGemini(data) {
     return parts.join('').trim();
 }
 
-function getAirFlowTextFromOpenRouter(data) {
+function afExtractOpenRouterText(data) {
     const content = data?.choices?.[0]?.message?.content;
     if (typeof content === 'string') return content.trim();
-    if (Array.isArray(content)) {
-        return content.map(part => typeof part === 'string' ? part : String(part?.text || '')).join('').trim();
-    }
+    if (Array.isArray(content)) return content.map(x => typeof x === 'string' ? x : String(x?.text || '')).join('').trim();
     return '';
 }
 
-async function callAirFlowGemini(env, messages, mode) {
+function afExtractSourcesFromGemini(data) {
+    const sources = [];
+    const chunks = data?.candidates?.[0]?.groundingMetadata?.groundingChunks || [];
+    for (const chunk of chunks) {
+        const web = chunk?.web;
+        if (web?.uri) sources.push({ title: String(web.title || web.uri), url: String(web.uri) });
+    }
+    return sources;
+}
+
+function afExtractUrls(text) {
+    const out = [];
+    const seen = new Set();
+    const re = /https?:\/\/[^\s)\]}>]+/g;
+    for (const raw of String(text || '').match(re) || []) {
+        const url = raw.replace(/[),.;]+$/g, '');
+        if (!seen.has(url)) { seen.add(url); out.push({ title: url, url }); }
+        if (out.length >= 10) break;
+    }
+    return out;
+}
+
+async function afGetActivePersonality(env) {
+    try {
+        const value = await env.STATS.get('af_personality_active', 'json');
+        if (value?.prompt) return String(value.prompt).slice(0, 8000);
+    } catch (_) {}
+    return AF_PERSONALITY;
+}
+
+function afBuildPrompt(mode, memories = [], personality = AF_PERSONALITY) {
+    const m = afMode(mode);
+    let prompt = `${personality}\n\nMODE: ${m}\nRULE: ${AF_MODE_RULES[m]}`;
+    if (memories.length) {
+        prompt += `\n\nUSER-CONTROLLED MEMORY (use only when relevant; never infer sensitive data):\n${memories.map(x => `- ${x.type}: ${x.value}`).join('\n')}`;
+    }
+    return prompt;
+}
+
+async function afGetMemory(env, email) {
+    const safe = await hashKey(String(email || '').toLowerCase());
+    return await env.STATS.get(`af_memory_${safe}`, 'json') || { preferences: [], projects: [], personality: [], conversation: [] };
+}
+
+async function afSaveMemory(env, email, memory) {
+    const safe = await hashKey(String(email || '').toLowerCase());
+    const normalized = {
+        preferences: Array.isArray(memory.preferences) ? memory.preferences.slice(0, 30) : [],
+        projects: Array.isArray(memory.projects) ? memory.projects.slice(0, 30) : [],
+        personality: Array.isArray(memory.personality) ? memory.personality.slice(0, 10) : [],
+        conversation: Array.isArray(memory.conversation) ? memory.conversation.slice(0, 20) : []
+    };
+    await env.STATS.put(`af_memory_${safe}`, JSON.stringify(normalized), { expirationTtl: AF_MEMORY_TTL });
+    return normalized;
+}
+
+async function afRememberExplicit(env, email, message) {
+    const text = String(message || '').trim();
+    const match = text.match(/^(?:recuerda|remember)\s+(?:que|that)\s+(.+)/i);
+    if (!match) return false;
+    const value = match[1].trim().slice(0, 500);
+    const memory = await afGetMemory(env, email);
+    memory.preferences = Array.isArray(memory.preferences) ? memory.preferences : [];
+    memory.preferences.unshift(value);
+    memory.preferences = [...new Set(memory.preferences)].slice(0, 30);
+    await afSaveMemory(env, email, memory);
+    return true;
+}
+
+async function afSaveConversation(env, email, history, mode = 'QUICK') {
+    const safe = await hashKey(String(email || '').toLowerCase());
+    const key = `af_conversations_${safe}`;
+    const current = await env.STATS.get(key, 'json') || [];
+    const normalized = afNormalizeMessages(history).slice(-AF_MAX_HISTORY_MESSAGES);
+    const firstUser = normalized.find(x => x.role === 'user');
+    const item = {
+        id: crypto.randomUUID(),
+        title: String(firstUser?.content || 'Nueva conversación').slice(0, 90),
+        mode: afMode(mode),
+        updated_at: new Date().toISOString(),
+        messages: normalized
+    };
+    const merged = [item, ...current.filter(x => x?.title !== item.title || x?.mode !== item.mode)].slice(0, AF_MAX_CONVERSATIONS);
+    await env.STATS.put(key, JSON.stringify(merged), { expirationTtl: AF_MEMORY_TTL });
+    return item;
+}
+
+async function afGetConversations(env, email, q = '') {
+    const safe = await hashKey(String(email || '').toLowerCase());
+    const items = await env.STATS.get(`af_conversations_${safe}`, 'json') || [];
+    const term = String(q || '').trim().toLowerCase();
+    return term ? items.filter(x => String(x?.title || '').toLowerCase().includes(term) || JSON.stringify(x?.messages || []).toLowerCase().includes(term)).slice(0, 20) : items.slice(0, 20);
+}
+
+async function afLogMetric(env, payload) {
+    try {
+        const now = new Date();
+        const hour = now.toISOString().slice(0, 13);
+        const key = `af_metric_${hour}`;
+        const current = await env.STATS.get(key, 'json') || {
+            requests: 0, errors: 0, searches: 0, vision: 0, files: 0, agent: 0, create: 0, feedback_up: 0, feedback_down: 0,
+            tokens: 0, latency_ms_total: 0, by_model: {}, by_mode: {}
+        };
+        current.requests += payload.request ? 1 : 0;
+        current.errors += payload.error ? 1 : 0;
+        current.searches += payload.search ? 1 : 0;
+        current.vision += payload.vision ? 1 : 0;
+        current.files += payload.file ? 1 : 0;
+        current.agent += payload.agent ? 1 : 0;
+        current.create += payload.create ? 1 : 0;
+        current.feedback_up += payload.feedback === 'up' ? 1 : 0;
+        current.feedback_down += payload.feedback === 'down' ? 1 : 0;
+        current.tokens += Math.max(0, Number(payload.tokens || 0));
+        current.latency_ms_total += Math.max(0, Number(payload.latency || 0));
+        if (payload.model) current.by_model[payload.model] = (current.by_model[payload.model] || 0) + 1;
+        if (payload.mode) current.by_mode[payload.mode] = (current.by_mode[payload.mode] || 0) + 1;
+        await env.STATS.put(key, JSON.stringify(current), { expirationTtl: AF_MAX_METRIC_KEYS * 3600 });
+    } catch (e) {
+        console.error('Air Flow metric error:', e?.message || e);
+    }
+}
+
+function afShouldSearch(mode, message) {
+    const m = afMode(mode);
+    if (['RESEARCH', 'TRAVEL', 'SHOPPING'].includes(m)) return true;
+    return /\b(investiga|busca|actual|últimas|ultimas|hoy|noticias|fuentes|verifica|fact.?check|compar(a|e)|precio|vuelos?|hoteles?|restaurantes?|qué pasó|que paso)\b/i.test(String(message || ''));
+}
+
+function afRouter(mode, message) {
+    const m = afMode(mode);
+    if (m === 'CREATE') return { primary: 'gemini', reason: 'creation' };
+    if (m === 'RESEARCH' || m === 'TRAVEL' || m === 'SHOPPING') return { primary: 'gemini', reason: 'grounding' };
+    if (m === 'CODE' || m === 'STUDY') return { primary: 'gemini', reason: 'quality' };
+    if (/\b(código|code|javascript|python|roblox|lua|cloudflare|debug)\b/i.test(message || '')) return { primary: 'gemini', reason: 'coding' };
+    return { primary: 'gemini', reason: 'default' };
+}
+
+async function afCallGemini(env, messages, mode, options = {}) {
     const apiKey = String(env.GEMINI_API_KEY || '').trim();
     if (!apiKey) throw new Error('GEMINI_API_KEY_NOT_CONFIGURED');
-    const model = String(env.GEMINI_MODEL || AIR_FLOW_GEMINI_MODEL_DEFAULT).trim();
-    const contents = messages.map(m => ({
-        role: m.role === 'assistant' ? 'model' : 'user',
-        parts: [{ text: m.content }]
-    }));
-    const systemInstruction = `${AIR_FLOW_SYSTEM_PROMPT}\n\nCurrent mode: ${String(mode || 'QUICK').toUpperCase()}. ${getAirFlowModeInstruction(mode)}`;
+    const model = String(env.GEMINI_MODEL || AF_GEMINI_MODEL_DEFAULT).trim();
+    const contents = messages.map(m => ({ role: m.role === 'assistant' ? 'model' : 'user', parts: [{ text: m.content }] }));
+    const body = {
+        systemInstruction: { parts: [{ text: afBuildPrompt(mode, options.memories || [], options.personality || AF_PERSONALITY) }] },
+        contents,
+        generationConfig: (model === AF_GEMINI_MODEL_DEFAULT || model.startsWith('gemini-3.')) ? { maxOutputTokens: options.maxOutputTokens || 1400 } : { temperature: 0.7, maxOutputTokens: options.maxOutputTokens || 1400 }
+    };
+    if (options.web) body.tools = [{ google_search: {} }];
+    const started = Date.now();
     const response = await fetch(`https://generativelanguage.googleapis.com/v1beta/models/${encodeURIComponent(model)}:generateContent`, {
-        method: 'POST',
-        headers: {
-            'Content-Type': 'application/json',
-            'x-goog-api-key': apiKey
-        },
-        body: JSON.stringify({
-            systemInstruction: { parts: [{ text: systemInstruction }] },
-            contents,
-            generationConfig: (model === 'gemini-3.8-flash' || model.startsWith('gemini-3.8-flash-'))
-                ? { maxOutputTokens: 1200 }
-                : { temperature: 0.7, maxOutputTokens: 1200 }
-        })
+        method: 'POST', headers: { 'Content-Type': 'application/json', 'x-goog-api-key': apiKey }, body: JSON.stringify(body)
     });
     const data = await response.json().catch(() => ({}));
+    const latency = Date.now() - started;
     if (!response.ok) {
-        console.error('Air Flow Gemini error:', response.status, JSON.stringify(data).slice(0, 1500));
+        console.error('Air Flow Gemini error:', response.status, JSON.stringify(data).slice(0, 1200));
         throw new Error(`GEMINI_HTTP_${response.status}`);
     }
-    const text = getAirFlowTextFromGemini(data);
+    const text = afQualityFilter(afExtractGeminiText(data));
     if (!text) throw new Error('GEMINI_EMPTY_RESPONSE');
-    return text;
+    return {
+        text,
+        provider: 'Gemini',
+        model,
+        latency,
+        tokens: Number(data?.usageMetadata?.totalTokenCount || 0),
+        sources: afExtractSourcesFromGemini(data),
+        searched: !!options.web
+    };
 }
 
-async function callAirFlowOpenRouter(env, messages, mode) {
+async function afCallOpenRouter(env, messages, mode, options = {}) {
     const apiKey = String(env.OPENROUTER_API_KEY || '').trim();
     if (!apiKey) throw new Error('OPENROUTER_API_KEY_NOT_CONFIGURED');
-    const model = String(env.OPENROUTER_MODEL || AIR_FLOW_OPENROUTER_MODEL_DEFAULT).trim();
-    const system = `${AIR_FLOW_SYSTEM_PROMPT}\n\nCurrent mode: ${String(mode || 'QUICK').toUpperCase()}. ${getAirFlowModeInstruction(mode)}`;
+    const model = String(env.OPENROUTER_MODEL || AF_OPENROUTER_MODEL_DEFAULT).trim();
+    const body = {
+        model,
+        messages: [{ role: 'system', content: afBuildPrompt(mode, options.memories || [], options.personality || AF_PERSONALITY) }, ...messages],
+        max_tokens: options.maxOutputTokens || 1400,
+        temperature: 0.7
+    };
+    if (options.web) body.plugins = [{ id: 'web', max_results: 5 }];
+    const started = Date.now();
     const response = await fetch('https://openrouter.ai/api/v1/chat/completions', {
         method: 'POST',
-        headers: {
-            'Content-Type': 'application/json',
-            'Authorization': `Bearer ${apiKey}`,
-            'HTTP-Referer': getBaseUrl(env),
-            'X-Title': 'Ocean Hub - Air Flow'
-        },
-        body: JSON.stringify({
-            model,
-            messages: [{ role: 'system', content: system }, ...messages],
-            temperature: 0.7,
-            max_tokens: 1200
-        })
+        headers: { 'Content-Type': 'application/json', 'Authorization': `Bearer ${apiKey}`, 'HTTP-Referer': getBaseUrl(env), 'X-Title': 'Ocean Hub - Air Flow' },
+        body: JSON.stringify(body)
     });
     const data = await response.json().catch(() => ({}));
+    const latency = Date.now() - started;
     if (!response.ok) {
-        console.error('Air Flow OpenRouter error:', response.status, JSON.stringify(data).slice(0, 1500));
+        console.error('Air Flow OpenRouter error:', response.status, JSON.stringify(data).slice(0, 1200));
         throw new Error(`OPENROUTER_HTTP_${response.status}`);
     }
-    const text = getAirFlowTextFromOpenRouter(data);
+    const text = afQualityFilter(afExtractOpenRouterText(data));
     if (!text) throw new Error('OPENROUTER_EMPTY_RESPONSE');
-    return text;
+    return {
+        text,
+        provider: 'OpenRouter',
+        model,
+        latency,
+        tokens: Number(data?.usage?.total_tokens || 0),
+        sources: afExtractUrls(text),
+        searched: !!options.web
+    };
 }
 
-async function generateAirFlowResponse(env, history, message, mode) {
-    const messages = [...history, { role: 'user', content: message }];
+async function afGenerate(env, history, message, mode, options = {}) {
+    const memories = options.memories || [];
+    const messages = [...afNormalizeMessages(history), { role: 'user', content: message }];
+    const search = options.web ?? afShouldSearch(mode, message);
+    const personality = options.personality || await afGetActivePersonality(env);
+    const route = afRouter(mode, message);
     const errors = [];
-
-    if (env.GEMINI_API_KEY) {
+    const providers = route.primary === 'openrouter' ? ['openrouter', 'gemini'] : ['gemini', 'openrouter'];
+    for (const provider of providers) {
         try {
-            return { text: await callAirFlowGemini(env, messages, mode), provider: 'Gemini' };
+            const result = provider === 'gemini'
+                ? await afCallGemini(env, messages, mode, { ...options, web: search, memories, personality })
+                : await afCallOpenRouter(env, messages, mode, { ...options, web: search, memories, personality });
+            if (search && !result.sources.length) {
+                const extra = afExtractUrls(result.text);
+                result.sources = extra;
+            }
+            return result;
         } catch (e) {
             errors.push(String(e?.message || e));
         }
     }
-
-    if (env.OPENROUTER_API_KEY) {
-        try {
-            return { text: await callAirFlowOpenRouter(env, messages, mode), provider: 'OpenRouter' };
-        } catch (e) {
-            errors.push(String(e?.message || e));
-        }
-    }
-
-    console.error('Air Flow providers unavailable:', errors.join(' | '));
+    console.error('Air Flow provider router failed:', errors.join(' | '));
     throw new Error('AIR_FLOW_NO_PROVIDER');
 }
 
-async function handleAirFlowPage(env, request) {
-    const auth = await requireAuth(env, request);
-    if (!auth) return Response.redirect(`${new URL(request.url).origin}/welcome`, 302);
-    const hasGemini = !!env.GEMINI_API_KEY;
-    const hasOpenRouter = !!env.OPENROUTER_API_KEY;
-    const providerLabel = hasGemini && hasOpenRouter ? 'Gemini + OpenRouter' : (hasGemini ? 'Gemini' : (hasOpenRouter ? 'OpenRouter' : 'Sin proveedor configurado'));
-    const safeName = escapeHTML(auth.user.name || auth.user.email?.split('@')[0] || 'amigo');
-
-    return new Response(`<!DOCTYPE html>
-<html lang="es">
-<head>
-<meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1.0">
-<title>✈️ Air Flow — Ocean Hub</title>
-<style>
-*{box-sizing:border-box}body{margin:0;min-height:100vh;background:#03050b;color:#fff;font-family:Inter,Segoe UI,system-ui,sans-serif;overflow:hidden}
-body:before{content:"";position:fixed;inset:-30%;background:radial-gradient(circle at 20% 20%,rgba(0,210,255,.16),transparent 30%),radial-gradient(circle at 80% 30%,rgba(135,70,255,.18),transparent 32%),radial-gradient(circle at 50% 90%,rgba(0,255,180,.09),transparent 30%);filter:blur(25px);animation:drift 18s ease-in-out infinite alternate;pointer-events:none}
-@keyframes drift{to{transform:translate(3%,-2%) scale(1.04)}}.app{position:relative;z-index:1;height:100vh;display:flex;flex-direction:column;max-width:1180px;margin:auto;padding:18px}
-.top{display:flex;align-items:center;justify-content:space-between;gap:15px}.brand{display:flex;align-items:center;gap:12px}.orb{width:44px;height:44px;border-radius:50%;background:conic-gradient(from 120deg,#00e5ff,#7c4dff,#00ffb3,#00e5ff);box-shadow:0 0 30px rgba(0,220,255,.35);position:relative}.orb:after{content:"✈";position:absolute;inset:0;display:grid;place-items:center;color:#041019;font-size:22px}.brand b{font-size:1.15rem}.brand small{display:block;color:#7f92a8}.back{color:#9cefff;text-decoration:none;padding:9px 13px;border:1px solid rgba(156,239,255,.2);border-radius:12px}
-.chat{flex:1;min-height:0;margin-top:15px;border:1px solid rgba(255,255,255,.09);background:rgba(7,11,20,.68);backdrop-filter:blur(18px);border-radius:24px;display:flex;flex-direction:column;overflow:hidden;box-shadow:0 25px 80px rgba(0,0,0,.35)}
-.hero{padding:25px 25px 15px;border-bottom:1px solid rgba(255,255,255,.07)}.hero h1{margin:0;font-size:clamp(1.8rem,4vw,3rem);letter-spacing:-1px}.hero h1 span{background:linear-gradient(90deg,#fff,#78e9ff,#a879ff);-webkit-background-clip:text;color:transparent}.hero p{margin:7px 0 0;color:#91a3b8}.status{margin-top:10px;font-size:.78rem;color:#6ee7c8}.messages{flex:1;overflow:auto;padding:22px;display:flex;flex-direction:column;gap:14px}.msg{max-width:min(820px,88%);padding:13px 15px;border-radius:18px;line-height:1.5;white-space:pre-wrap;word-wrap:break-word}.msg.user{align-self:flex-end;background:linear-gradient(135deg,#087ea0,#5b43c6);border-bottom-right-radius:6px}.msg.ai{align-self:flex-start;background:rgba(255,255,255,.065);border:1px solid rgba(255,255,255,.07);border-bottom-left-radius:6px}.meta{font-size:.68rem;color:#77879b;margin-bottom:5px}.composer{padding:14px;border-top:1px solid rgba(255,255,255,.07);display:flex;gap:10px;align-items:end}.composer textarea{flex:1;resize:none;min-height:48px;max-height:150px;border:1px solid rgba(255,255,255,.1);border-radius:16px;background:rgba(0,0,0,.3);color:white;padding:13px 14px;outline:none;font:inherit}.composer textarea:focus{border-color:#53dfff}.send{width:52px;height:48px;border:0;border-radius:15px;background:linear-gradient(135deg,#00d9ff,#7857ff);color:#061018;font-size:20px;font-weight:800;cursor:pointer}.send:disabled{opacity:.5;cursor:not-allowed}.tools{padding:0 14px 12px;display:flex;gap:7px;flex-wrap:wrap}.mode{border:1px solid rgba(255,255,255,.1);background:rgba(255,255,255,.04);color:#b7c7d9;border-radius:999px;padding:7px 10px;cursor:pointer;font-size:.75rem}.mode.active{color:white;border-color:#5de7ff;background:rgba(0,220,255,.12)}.empty{margin:auto;text-align:center;color:#71849a;max-width:600px}.empty b{display:block;color:#dcecff;font-size:1.1rem;margin-bottom:6px}.typing{opacity:.7}
-@media(max-width:650px){.app{padding:10px}.hero{padding:18px 16px 12px}.messages{padding:15px}.msg{max-width:94%}.back{font-size:.8rem}.brand small{display:none}}
-</style></head>
-<body><div class="app"><div class="top"><div class="brand"><div class="orb"> </div><div><b>Air Flow</b><small>Ocean Hub AI</small></div></div><a class="back" href="/home">← Ocean Hub</a></div>
-<div class="chat"><div class="hero"><h1>Tu <span>Air Flow</span>, ${safeName}.</h1><p>Pregunta lo que quieras. Directo, natural y con tu ritmo. ✈️</p><div class="status">● ${escapeHTML(providerLabel)}</div></div>
-<div id="messages" class="messages"><div class="empty" id="empty"><b>¿Qué hacemos?</b>Puedo ayudarte con código, estudio, ideas, Roblox, planes y preguntas del día a día.</div></div>
-<div class="tools"><button class="mode active" data-mode="QUICK">⚡ Quick</button><button class="mode" data-mode="THINK">🧠 Think</button><button class="mode" data-mode="CODE">💻 Code</button><button class="mode" data-mode="STUDY">📚 Study</button><button class="mode" data-mode="GAMING">🎮 Gaming</button><button class="mode" data-mode="CREATE">🎨 Create</button><button class="mode" data-mode="TRAVEL">✈️ Travel</button><button class="mode" data-mode="PLANNER">📅 Planner</button></div>
-<div class="composer"><textarea id="input" maxlength="${AIR_FLOW_MAX_MESSAGE_CHARS}" placeholder="Pregunta lo que quieras..." aria-label="Mensaje para Air Flow"></textarea><button id="send" class="send" title="Enviar">➤</button></div></div></div>
-<script>
-const MAX=${AIR_FLOW_MAX_MESSAGE_CHARS};let mode='QUICK';let history=[];const box=document.getElementById('messages'),input=document.getElementById('input'),send=document.getElementById('send'),empty=document.getElementById('empty');
-function add(role,text,typing=false){if(empty)empty.remove();const d=document.createElement('div');d.className='msg '+(role==='user'?'user':'ai')+(typing?' typing':'');const m=document.createElement('div');m.className='meta';m.textContent=role==='user'?'TÚ':'AIR FLOW';const t=document.createElement('div');t.textContent=text;d.append(m,t);box.appendChild(d);box.scrollTop=box.scrollHeight;return d}
-async function sendMsg(){const text=input.value.trim();if(!text||send.disabled)return;if(text.length>MAX)return;input.value='';add('user',text);send.disabled=true;const wait=add('assistant','Pensando... ',true);try{const res=await fetch('/air-flow/chat',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({message:text,history,mode})});const data=await res.json().catch(()=>({}));wait.remove();if(!res.ok)throw new Error(data.error||'No pude responder ahora.');add('assistant',data.reply||'No recibí una respuesta válida.');history.push({role:'user',content:text},{role:'assistant',content:data.reply||''});history=history.slice(-12)}catch(e){wait.remove();add('assistant','⚠️ '+(e.message||'Error inesperado.'));}finally{send.disabled=false;input.focus()}}
-document.querySelectorAll('.mode').forEach(b=>b.onclick=()=>{document.querySelectorAll('.mode').forEach(x=>x.classList.remove('active'));b.classList.add('active');mode=b.dataset.mode});send.onclick=sendMsg;input.addEventListener('keydown',e=>{if(e.key==='Enter'&&!e.shiftKey){e.preventDefault();sendMsg()}});input.focus();
-</script></body></html>`, { headers: { 'Content-Type': 'text/html; charset=utf-8' } });
-}
-
-async function handleAirFlowChat(env, request) {
+async function handleAirFlowChatV11(env, request) {
     const auth = await requireAuth(env, request);
     if (!auth) return jsonResponse({ error: 'No autorizado' }, 403);
     if (request.method !== 'POST') return jsonResponse({ error: 'Método no permitido' }, 405);
-    if (!env.GEMINI_API_KEY && !env.OPENROUTER_API_KEY) return jsonResponse({ error: 'Air Flow no está configurado todavía.' }, 503);
-    if (!(await checkAirFlowRateLimit(env, request, auth.user.email))) return jsonResponse({ error: 'Demasiados mensajes. Espera un momento e inténtalo de nuevo.' }, 429);
-
+    if (!(await afRateLimit(env, request, auth.user.email, 'chat'))) return jsonResponse({ error: 'Demasiados mensajes. Espera un momento.' }, 429);
     let body;
     try { body = await request.json(); } catch { return jsonResponse({ error: 'JSON inválido' }, 400); }
     const message = String(body?.message || '').trim();
+    const mode = afMode(body?.mode);
     if (!message) return jsonResponse({ error: 'Escribe un mensaje.' }, 400);
-    if (message.length > AIR_FLOW_MAX_MESSAGE_CHARS) return jsonResponse({ error: `El mensaje no puede superar ${AIR_FLOW_MAX_MESSAGE_CHARS} caracteres.` }, 413);
-    const history = normalizeAirFlowHistory(body?.history);
-    const mode = String(body?.mode || 'QUICK').toUpperCase().slice(0, 20);
-
+    if (message.length > AF_MAX_MESSAGE_CHARS) return jsonResponse({ error: `El mensaje no puede superar ${AF_MAX_MESSAGE_CHARS} caracteres.` }, 413);
+    if (!env.GEMINI_API_KEY && !env.OPENROUTER_API_KEY) return jsonResponse({ error: 'Air Flow no tiene proveedores configurados.' }, 503);
+    const started = Date.now();
     try {
-        const result = await generateAirFlowResponse(env, history, message, mode);
-        return jsonResponse({ reply: result.text.slice(0, 12000), provider: result.provider, mode });
+        await afRememberExplicit(env, auth.user.email, message);
+        const memory = await afGetMemory(env, auth.user.email);
+        const memoryItems = [
+            ...(memory.preferences || []).slice(0, 10).map(value => ({ type: 'preference', value })),
+            ...(memory.projects || []).slice(0, 10).map(value => ({ type: 'project', value })),
+            ...(memory.personality || []).slice(0, 5).map(value => ({ type: 'personality', value }))
+        ];
+        const result = await afGenerate(env, body?.history, message, mode, { memories: memoryItems });
+        const history = afNormalizeMessages([...(body?.history || []), { role: 'user', content: message }, { role: 'assistant', content: result.text }]);
+        await afSaveConversation(env, auth.user.email, history, mode);
+        await afLogMetric(env, { request: true, search: result.searched, tokens: result.tokens, latency: Date.now() - started, model: result.model, mode });
+        return jsonResponse({ reply: result.text, provider: result.provider, model: result.model, sources: result.sources || [], searched: !!result.searched, mode });
     } catch (error) {
-        console.error('Air Flow request failed:', error?.message || error);
-        return jsonResponse({ error: 'Air Flow no pudo responder ahora. Revisa las claves/proveedores configurados.' }, 502);
+        await afLogMetric(env, { request: true, error: true, latency: Date.now() - started, mode });
+        console.error('Air Flow V11 chat failed:', error?.message || error);
+        return jsonResponse({ error: '⚠️ Air Flow no pudo responder ahora. Revisa los proveedores configurados.' }, 502);
     }
+}
+
+async function handleAirFlowVisionV11(env, request) {
+    const auth = await requireAuth(env, request);
+    if (!auth) return jsonResponse({ error: 'No autorizado' }, 403);
+    if (request.method !== 'POST') return jsonResponse({ error: 'Método no permitido' }, 405);
+    if (!(await afRateLimit(env, request, auth.user.email, 'vision'))) return jsonResponse({ error: 'Límite de visión alcanzado. Espera un momento.' }, 429);
+    let body;
+    try { body = await request.json(); } catch { return jsonResponse({ error: 'JSON inválido' }, 400); }
+    const data = String(body?.image?.data || '');
+    const mime = String(body?.image?.mimeType || 'image/png');
+    const prompt = String(body?.prompt || 'Analiza esta imagen con detalle. Si contiene texto, transcríbelo y explica lo importante.').slice(0, 3000);
+    if (!data) return jsonResponse({ error: 'Falta la imagen.' }, 400);
+    let rawBytes = 0;
+    try { rawBytes = Math.floor(data.replace(/^data:[^;]+;base64,/, '').length * 0.75); } catch { rawBytes = AF_MAX_UPLOAD_BYTES + 1; }
+    if (rawBytes > AF_MAX_UPLOAD_BYTES) return jsonResponse({ error: 'La imagen es demasiado grande.' }, 413);
+    try {
+        const apiKey = String(env.GEMINI_API_KEY || '').trim();
+        if (!apiKey) throw new Error('GEMINI_API_KEY_NOT_CONFIGURED');
+        const model = String(env.GEMINI_MODEL || AF_GEMINI_MODEL_DEFAULT).trim();
+        const started = Date.now();
+        const cleanB64 = data.replace(/^data:[^;]+;base64,/, '');
+        const response = await fetch(`https://generativelanguage.googleapis.com/v1beta/models/${encodeURIComponent(model)}:generateContent`, {
+            method: 'POST', headers: { 'Content-Type': 'application/json', 'x-goog-api-key': apiKey },
+            body: JSON.stringify({
+                systemInstruction: { parts: [{ text: afBuildPrompt('VISION') }] },
+                contents: [{ role: 'user', parts: [{ text: prompt }, { inline_data: { mime_type: mime, data: cleanB64 } }] }],
+                generationConfig: { maxOutputTokens: 1600 }
+            })
+        });
+        const out = await response.json().catch(() => ({}));
+        if (!response.ok) throw new Error(`GEMINI_HTTP_${response.status}`);
+        const text = afQualityFilter(afExtractGeminiText(out));
+        if (!text) throw new Error('GEMINI_EMPTY_RESPONSE');
+        await afLogMetric(env, { vision: true, request: true, latency: Date.now() - started, tokens: Number(out?.usageMetadata?.totalTokenCount || 0), model, mode: 'VISION' });
+        return jsonResponse({ reply: text, provider: 'Gemini', model, capabilities: ['vision', 'ocr', 'image_analysis'] });
+    } catch (error) {
+        console.error('Air Flow Vision failed:', error?.message || error);
+        return jsonResponse({ error: 'No pude analizar la imagen ahora.' }, 502);
+    }
+}
+
+async function handleAirFlowFileV11(env, request) {
+    const auth = await requireAuth(env, request);
+    if (!auth) return jsonResponse({ error: 'No autorizado' }, 403);
+    if (request.method !== 'POST') return jsonResponse({ error: 'Método no permitido' }, 405);
+    if (!(await afRateLimit(env, request, auth.user.email, 'file'))) return jsonResponse({ error: 'Límite de archivos alcanzado. Espera un momento.' }, 429);
+    let body;
+    try { body = await request.json(); } catch { return jsonResponse({ error: 'JSON inválido' }, 400); }
+    const file = body?.file || {};
+    const data = String(file.data || '');
+    const mime = String(file.mimeType || 'text/plain');
+    const name = String(file.name || 'archivo').slice(0, 160);
+    const prompt = String(body?.prompt || `Analiza el archivo ${name}. Resume su contenido, detecta puntos importantes y responde según lo solicitado.`).slice(0, 3000);
+    if (!data) return jsonResponse({ error: 'Falta el archivo.' }, 400);
+    const cleanB64 = data.replace(/^data:[^;]+;base64,/, '');
+    const rawBytes = Math.floor(cleanB64.length * 0.75);
+    if (rawBytes > AF_MAX_UPLOAD_BYTES) return jsonResponse({ error: 'El archivo supera el límite de 10 MB.' }, 413);
+    if (/^(text\/|application\/(json|csv))/.test(mime)) {
+        try {
+            const text = await afReadFileAsText(data, mime);
+            if (text) {
+                const result = await afGenerate(env, [], `${prompt}\n\nCONTENIDO DEL ARCHIVO:\n${text}`, 'RESEARCH', { web: false });
+                const owner = await hashKey(String(auth.user.email || '').toLowerCase());
+                const fileId = crypto.randomUUID();
+                const indexKey = `af_files_${owner}`;
+                const index = await env.STATS.get(indexKey, 'json') || [];
+                await env.STATS.put(`af_file_${owner}_${fileId}`, JSON.stringify({ id: fileId, name, mime, text, created_at: new Date().toISOString() }), { expirationTtl: AF_MEMORY_TTL });
+                const nextIndex = [{ id: fileId, name, mime, created_at: new Date().toISOString() }, ...index].slice(0, 20);
+                await env.STATS.put(indexKey, JSON.stringify(nextIndex), { expirationTtl: AF_MEMORY_TTL });
+                await afLogMetric(env, { file: true, request: true, latency: result.latency, tokens: result.tokens, model: result.model, mode: 'FILES' });
+                return jsonResponse({ reply: result.text, provider: result.provider, model: result.model, file: { id: fileId, name, mime, searchable_text: true } });
+            }
+        } catch (_) {}
+    }
+    try {
+        const apiKey = String(env.GEMINI_API_KEY || '').trim();
+        if (!apiKey) throw new Error('GEMINI_API_KEY_NOT_CONFIGURED');
+        const model = String(env.GEMINI_MODEL || AF_GEMINI_MODEL_DEFAULT).trim();
+        const started = Date.now();
+        const response = await fetch(`https://generativelanguage.googleapis.com/v1beta/models/${encodeURIComponent(model)}:generateContent`, {
+            method: 'POST', headers: { 'Content-Type': 'application/json', 'x-goog-api-key': apiKey },
+            body: JSON.stringify({
+                systemInstruction: { parts: [{ text: afBuildPrompt('RESEARCH') }] },
+                contents: [{ role: 'user', parts: [{ text: prompt }, { inline_data: { mime_type: mime, data: cleanB64 } }] }],
+                generationConfig: { maxOutputTokens: 1800 }
+            })
+        });
+        const out = await response.json().catch(() => ({}));
+        if (!response.ok) throw new Error(`GEMINI_HTTP_${response.status}`);
+        const reply = afQualityFilter(afExtractGeminiText(out));
+        if (!reply) throw new Error('GEMINI_EMPTY_RESPONSE');
+        await afLogMetric(env, { file: true, request: true, latency: Date.now() - started, tokens: Number(out?.usageMetadata?.totalTokenCount || 0), model, mode: 'FILES' });
+        return jsonResponse({ reply, provider: 'Gemini', model, file: { name, mime, searchable_text: false } });
+    } catch (error) {
+        console.error('Air Flow File failed:', error?.message || error);
+        return jsonResponse({ error: 'No pude analizar este archivo. Prueba con PDF, imagen o texto compatible y menor de 10 MB.' }, 502);
+    }
+}
+
+async function handleAirFlowMemoryV11(env, request) {
+    const auth = await requireAuth(env, request);
+    if (!auth) return jsonResponse({ error: 'No autorizado' }, 403);
+    const memory = await afGetMemory(env, auth.user.email);
+    if (request.method === 'GET') return jsonResponse({ memory });
+    if (request.method !== 'POST' && request.method !== 'DELETE') return jsonResponse({ error: 'Método no permitido' }, 405);
+    let body = {};
+    try { body = request.method === 'DELETE' ? {} : await request.json(); } catch { return jsonResponse({ error: 'JSON inválido' }, 400); }
+    if (request.method === 'DELETE') {
+        const kind = String(body?.type || '').trim();
+        if (!kind) return jsonResponse({ error: 'Falta type.' }, 400);
+        if (kind === 'all') {
+            await afSaveMemory(env, auth.user.email, { preferences: [], projects: [], personality: [], conversation: [] });
+            return jsonResponse({ ok: true, message: 'Memoria permanente eliminada.' });
+        }
+        const next = { ...memory, [kind]: [] };
+        await afSaveMemory(env, auth.user.email, next);
+        return jsonResponse({ ok: true, memory: next });
+    }
+    const type = String(body?.type || 'preferences');
+    const value = String(body?.value || '').trim().slice(0, 500);
+    if (!['preferences', 'projects', 'personality', 'conversation'].includes(type) || !value) return jsonResponse({ error: 'Tipo o valor inválido.' }, 400);
+    memory[type] = Array.isArray(memory[type]) ? memory[type] : [];
+    memory[type].unshift(value);
+    memory[type] = [...new Set(memory[type])].slice(0, type === 'conversation' ? 20 : 30);
+    const saved = await afSaveMemory(env, auth.user.email, memory);
+    return jsonResponse({ ok: true, memory: saved });
+}
+
+async function handleAirFlowConversationsV11(env, request) {
+    const auth = await requireAuth(env, request);
+    if (!auth) return jsonResponse({ error: 'No autorizado' }, 403);
+    if (request.method !== 'GET') return jsonResponse({ error: 'Método no permitido' }, 405);
+    const url = new URL(request.url);
+    return jsonResponse({ conversations: await afGetConversations(env, auth.user.email, url.searchParams.get('q') || '') });
+}
+
+async function handleAirFlowFeedbackV11(env, request) {
+    const auth = await requireAuth(env, request);
+    if (!auth) return jsonResponse({ error: 'No autorizado' }, 403);
+    if (request.method !== 'POST') return jsonResponse({ error: 'Método no permitido' }, 405);
+    let body; try { body = await request.json(); } catch { return jsonResponse({ error: 'JSON inválido' }, 400); }
+    const feedback = body?.feedback === 'down' ? 'down' : 'up';
+    await afLogMetric(env, { feedback, mode: afMode(body?.mode) });
+    return jsonResponse({ ok: true });
+}
+
+async function handleAirFlowAgentV11(env, request) {
+    const auth = await requireAuth(env, request);
+    if (!auth) return jsonResponse({ error: 'No autorizado' }, 403);
+    if (request.method !== 'POST') return jsonResponse({ error: 'Método no permitido' }, 405);
+    if (!(await afRateLimit(env, request, auth.user.email, 'agent'))) return jsonResponse({ error: 'Límite del agente alcanzado.' }, 429);
+    let body; try { body = await request.json(); } catch { return jsonResponse({ error: 'JSON inválido' }, 400); }
+    const goal = String(body?.goal || '').trim().slice(0, 4000);
+    const approve = body?.approve === true;
+    if (!goal) return jsonResponse({ error: 'Falta el objetivo.' }, 400);
+
+    const lower = goal.toLowerCase();
+    const steps = [];
+    if (/investig|fuentes|noticias|actual|web/.test(lower)) steps.push({ id: 'research', label: 'Investigar', tool: 'web_search', sensitive: false });
+    steps.push({ id: 'analyze', label: 'Analizar y organizar', tool: 'model_analysis', sensitive: false });
+    if (/presenta|documento|pdf|informe|archivo/.test(lower)) steps.push({ id: 'create', label: 'Crear documento', tool: 'create_text_document', sensitive: false });
+    if (/enviar|comprar|borrar|eliminar|publicar|mensaje/.test(lower)) steps.push({ id: 'sensitive', label: 'Acción sensible', tool: 'external_action', sensitive: true, requires_confirmation: true });
+
+    if (!approve) {
+        await afLogMetric(env, { agent: true, request: true, mode: 'AGENT' });
+        return jsonResponse({ status: 'requires_confirmation', plan: steps, goal });
+    }
+
+    const results = [];
+    let context = '';
+    for (const step of steps) {
+        if (step.sensitive) {
+            results.push({ id: step.id, status: 'blocked', message: 'Esta acción requiere una integración externa y confirmación específica.' });
+            continue;
+        }
+        if (step.id === 'research') {
+            try {
+                const r = await afGenerate(env, [], goal, 'RESEARCH', { web: true, maxOutputTokens: 1800 });
+                context += `\n\nRESEARCH:\n${r.text}`;
+                results.push({ id: step.id, status: 'completed', output: r.text, sources: r.sources || [] });
+            } catch (e) {
+                results.push({ id: step.id, status: 'error', message: 'No se pudo completar la investigación.' });
+            }
+        } else if (step.id === 'analyze') {
+            try {
+                const r = await afGenerate(env, [], `Organiza y resume el objetivo del usuario.${context}\n\nOBJETIVO:\n${goal}`, 'THINK', { web: false, maxOutputTokens: 1600 });
+                context += `\n\nANALYSIS:\n${r.text}`;
+                results.push({ id: step.id, status: 'completed', output: r.text });
+            } catch (e) {
+                results.push({ id: step.id, status: 'error', message: 'No se pudo completar el análisis.' });
+            }
+        } else if (step.id === 'create') {
+            const artifactId = crypto.randomUUID();
+            const content = `# Air Flow — Resultado\n\n## Objetivo\n${goal}\n\n## Resultado\n${context.trim()}\n`;
+            await env.STATS.put(`af_artifact_${artifactId}`, JSON.stringify({ id: artifactId, owner: auth.user.email, name: 'air-flow-result.md', mime: 'text/markdown', content, created_at: new Date().toISOString() }), { expirationTtl: 86400 * 7 });
+            results.push({ id: step.id, status: 'completed', artifact: `/air-flow/artifact/${artifactId}` });
+        }
+    }
+    await afLogMetric(env, { agent: true, request: true, mode: 'AGENT' });
+    return jsonResponse({ status: 'completed', goal, plan: steps, results });
+}
+
+async function handleAirFlowArtifactV11(env, request) {
+    const auth = await requireAuth(env, request);
+    if (!auth) return new Response('No autorizado', { status: 403 });
+    const id = new URL(request.url).pathname.split('/').pop();
+    const artifact = await env.STATS.get(`af_artifact_${id}`, 'json');
+    if (!artifact || artifact.owner !== auth.user.email) return new Response('Archivo no encontrado', { status: 404 });
+    return new Response(String(artifact.content || ''), { headers: { 'Content-Type': `${artifact.mime || 'text/plain'}; charset=utf-8`, 'Content-Disposition': `attachment; filename="${String(artifact.name || 'air-flow-result.md').replace(/"/g, '')}"` } });
+}
+
+async function handleAirFlowCreateImageV11(env, request) {
+    const auth = await requireAuth(env, request);
+    if (!auth) return jsonResponse({ error: 'No autorizado' }, 403);
+    if (request.method !== 'POST') return jsonResponse({ error: 'Método no permitido' }, 405);
+    if (!(await afRateLimit(env, request, auth.user.email, 'create'))) return jsonResponse({ error: 'Límite de creación alcanzado.' }, 429);
+    const apiKey = String(env.GEMINI_API_KEY || '').trim();
+    if (!apiKey) return jsonResponse({ error: 'Falta GEMINI_API_KEY.' }, 503);
+    let body; try { body = await request.json(); } catch { return jsonResponse({ error: 'JSON inválido' }, 400); }
+    const prompt = String(body?.prompt || '').trim().slice(0, 3000);
+    if (!prompt) return jsonResponse({ error: 'Falta el prompt.' }, 400);
+    const model = String(env.GEMINI_IMAGE_MODEL || AF_IMAGE_MODEL_DEFAULT).trim();
+    try {
+        const response = await fetch(`https://generativelanguage.googleapis.com/v1beta/models/${encodeURIComponent(model)}:generateContent`, {
+            method: 'POST', headers: { 'Content-Type': 'application/json', 'x-goog-api-key': apiKey },
+            body: JSON.stringify({
+                contents: [{ parts: [{ text: `${AF_PERSONALITY}\nCreate an image from this request:\n${prompt}` }] }],
+                generationConfig: { responseModalities: ['IMAGE'] }
+            })
+        });
+        const data = await response.json().catch(() => ({}));
+        if (!response.ok) throw new Error(`GEMINI_HTTP_${response.status}`);
+        for (const candidate of data?.candidates || []) {
+            for (const part of candidate?.content?.parts || []) {
+                const blob = part?.inlineData || part?.inline_data;
+                if (blob?.data) {
+                    await afLogMetric(env, { create: true, request: true, model, mode: 'CREATE' });
+                    return jsonResponse({ ok: true, model, mimeType: blob.mimeType || blob.mime_type || 'image/png', data: blob.data });
+                }
+            }
+        }
+        throw new Error('GEMINI_NO_IMAGE');
+    } catch (e) {
+        console.error('Air Flow image creation failed:', e?.message || e);
+        return jsonResponse({ error: 'La generación de imágenes no está disponible en este momento.' }, 502);
+    }
+}
+
+async function handleAirFlowLiveTokenV11(env, request) {
+    const auth = await requireAuth(env, request);
+    if (!auth) return jsonResponse({ error: 'No autorizado' }, 403);
+    if (request.method !== 'POST') return jsonResponse({ error: 'Método no permitido' }, 405);
+    if (!(await afRateLimit(env, request, auth.user.email, 'live'))) return jsonResponse({ error: 'Límite de sesiones Live alcanzado.' }, 429);
+    const apiKey = String(env.GEMINI_API_KEY || '').trim();
+    if (!apiKey) return jsonResponse({ error: 'Falta GEMINI_API_KEY.' }, 503);
+    const model = String(env.GEMINI_LIVE_MODEL || AF_LIVE_MODEL_DEFAULT).trim();
+    const expire = new Date(Date.now() + 30 * 60 * 1000).toISOString();
+    const newSession = new Date(Date.now() + 60 * 1000).toISOString();
+    try {
+        const response = await fetch('https://generativelanguage.googleapis.com/v1beta/auth_tokens', {
+            method: 'POST', headers: { 'Content-Type': 'application/json', 'x-goog-api-key': apiKey },
+            body: JSON.stringify({
+                uses: 1,
+                expireTime: expire,
+                newSessionExpireTime: newSession,
+                liveConnectConstraints: {
+                    model: `models/${model}`,
+                    config: { responseModalities: ['AUDIO'], sessionResumption: {} }
+                }
+            })
+        });
+        const data = await response.json().catch(() => ({}));
+        if (!response.ok || !data?.name) throw new Error(`GEMINI_LIVE_TOKEN_HTTP_${response.status}`);
+        return jsonResponse({ token: data.name, model, expires_at: expire, websocket: 'wss://generativelanguage.googleapis.com/ws/google.ai.generativelanguage.v1beta.GenerativeService.BidiGenerateContentConstrained' });
+    } catch (e) {
+        console.error('Air Flow Live token failed:', e?.message || e);
+        return jsonResponse({ error: 'Air Flow Live no está disponible ahora.' }, 502);
+    }
+}
+
+async function handleAirFlowPermissionsV11(env, request) {
+    const auth = await requireAuth(env, request);
+    if (!auth) return jsonResponse({ error: 'No autorizado' }, 403);
+    const key = `af_permissions_${await hashKey(String(auth.user.email).toLowerCase())}`;
+    const current = await env.STATS.get(key, 'json') || { tools: {} };
+    if (request.method === 'GET') return jsonResponse({ permissions: current });
+    if (request.method !== 'POST') return jsonResponse({ error: 'Método no permitido' }, 405);
+    let body; try { body = await request.json(); } catch { return jsonResponse({ error: 'JSON inválido' }, 400); }
+    const tool = String(body?.tool || '').slice(0, 60);
+    if (!tool) return jsonResponse({ error: 'Falta tool.' }, 400);
+    current.tools[tool] = body?.enabled === true;
+    await env.STATS.put(key, JSON.stringify(current), { expirationTtl: AF_MEMORY_TTL });
+    return jsonResponse({ permissions: current });
+}
+
+async function handleAirFlowAdminV11(env, request) {
+    const auth = await requireAdmin(env, request);
+    if (!auth) return jsonResponse({ error: 'No autorizado' }, 403);
+    const url = new URL(request.url);
+    const hours = Math.min(48, Math.max(1, Number(url.searchParams.get('hours') || 24)));
+    const metrics = [];
+    for (let i = 0; i < hours; i++) {
+        const d = new Date(Date.now() - i * 3600000);
+        const hour = d.toISOString().slice(0, 13);
+        const value = await env.STATS.get(`af_metric_${hour}`, 'json');
+        if (value) metrics.push({ hour, ...value });
+    }
+    const total = metrics.reduce((a, x) => ({
+        requests: a.requests + (x.requests || 0), errors: a.errors + (x.errors || 0), searches: a.searches + (x.searches || 0),
+        vision: a.vision + (x.vision || 0), files: a.files + (x.files || 0), agent: a.agent + (x.agent || 0), create: a.create + (x.create || 0),
+        feedback_up: a.feedback_up + (x.feedback_up || 0), feedback_down: a.feedback_down + (x.feedback_down || 0), tokens: a.tokens + (x.tokens || 0),
+        latency_ms_total: a.latency_ms_total + (x.latency_ms_total || 0)
+    }), { requests:0, errors:0, searches:0, vision:0, files:0, agent:0, create:0, feedback_up:0, feedback_down:0, tokens:0, latency_ms_total:0 });
+    const models = {};
+    const modes = {};
+    for (const item of metrics) {
+        for (const [k, v] of Object.entries(item.by_model || {})) models[k] = (models[k] || 0) + v;
+        for (const [k, v] of Object.entries(item.by_mode || {})) modes[k] = (modes[k] || 0) + v;
+    }
+    const avgLatency = total.requests ? Math.round(total.latency_ms_total / total.requests) : 0;
+    return jsonResponse({ period_hours: hours, total, avg_latency_ms: avgLatency, by_model: models, by_mode: modes, note: 'Las métricas se agregan en KV y no incluyen el contenido de las conversaciones.' });
+}
+
+async function handleAirFlowPersonalityLabV11(env, request) {
+    const auth = await requireAdmin(env, request);
+    if (!auth) return jsonResponse({ error: 'No autorizado' }, 403);
+    const key = 'af_personality_versions';
+    const versions = await env.STATS.get(key, 'json') || [{ id: 'default', created_at: new Date().toISOString(), prompt: AF_PERSONALITY }];
+    if (request.method === 'GET') return jsonResponse({ active: versions[0], versions: versions.slice(0, 20) });
+    if (request.method !== 'POST') return jsonResponse({ error: 'Método no permitido' }, 405);
+    let body; try { body = await request.json(); } catch { return jsonResponse({ error: 'JSON inválido' }, 400); }
+    const action = String(body?.action || 'test');
+    if (action === 'save') {
+        const prompt = String(body?.prompt || '').trim().slice(0, 8000);
+        if (!prompt) return jsonResponse({ error: 'Falta prompt.' }, 400);
+        const next = [{ id: crypto.randomUUID(), created_at: new Date().toISOString(), prompt }, ...versions].slice(0, 20);
+        await env.STATS.put(key, JSON.stringify(next), { expirationTtl: AF_MEMORY_TTL });
+        return jsonResponse({ active: next[0], versions: next });
+    }
+    if (action === 'activate') {
+        const id = String(body?.id || '');
+        const selected = versions.find(x => x.id === id);
+        if (!selected) return jsonResponse({ error: 'Versión no encontrada.' }, 404);
+        await env.STATS.put('af_personality_active', JSON.stringify(selected), { expirationTtl: AF_MEMORY_TTL });
+        const next = [selected, ...versions.filter(x => x.id !== id)].slice(0, 20);
+        await env.STATS.put(key, JSON.stringify(next), { expirationTtl: AF_MEMORY_TTL });
+        return jsonResponse({ active: selected, versions: next });
+    }
+    const prompt = String(body?.input || 'Dame una respuesta corta de ejemplo.').slice(0, 1500);
+    const mode = afMode(body?.mode || 'QUICK');
+    const results = [];
+    if (env.GEMINI_API_KEY) {
+        try { results.push({ provider: 'Gemini', text: (await afCallGemini(env, [{ role:'user', content:prompt }], mode, { memories: [] })).text }); } catch (_) {}
+    }
+    if (env.OPENROUTER_API_KEY) {
+        try { results.push({ provider: 'OpenRouter', text: (await afCallOpenRouter(env, [{ role:'user', content:prompt }], mode, { memories: [] })).text }); } catch (_) {}
+    }
+    return jsonResponse({ active: versions[0], results });
+}
+
+async function handleAirFlowStatusV11(env, request) {
+    const auth = await requireAuth(env, request);
+    if (!auth) return jsonResponse({ error: 'No autorizado' }, 403);
+    return jsonResponse({
+        online: !!(env.GEMINI_API_KEY || env.OPENROUTER_API_KEY),
+        providers: { gemini: !!env.GEMINI_API_KEY, openrouter: !!env.OPENROUTER_API_KEY },
+        models: { gemini: env.GEMINI_MODEL || AF_GEMINI_MODEL_DEFAULT, openrouter: env.OPENROUTER_MODEL || AF_OPENROUTER_MODEL_DEFAULT, live: env.GEMINI_LIVE_MODEL || AF_LIVE_MODEL_DEFAULT, image: env.GEMINI_IMAGE_MODEL || AF_IMAGE_MODEL_DEFAULT },
+        capabilities: ['chat','router','fallback','web_search','research','vision','ocr','files','memory','conversations','agent_planner','safe_artifacts','image_generation','live_tokens','permissions','admin_metrics','personality_lab']
+    });
+}
+
+
+async function handleAirFlowResearchV11(env, request) {
+    const auth = await requireAuth(env, request);
+    if (!auth) return jsonResponse({ error: 'No autorizado' }, 403);
+    if (request.method !== 'POST') return jsonResponse({ error: 'Método no permitido' }, 405);
+    if (!(await afRateLimit(env, request, auth.user.email, 'research'))) return jsonResponse({ error: 'Límite de investigación alcanzado.' }, 429);
+    let body; try { body = await request.json(); } catch { return jsonResponse({ error: 'JSON inválido' }, 400); }
+    const query = String(body?.query || '').trim().slice(0, 4000);
+    if (!query) return jsonResponse({ error: 'Falta la consulta.' }, 400);
+    try {
+        const result = await afGenerate(env, [], query, 'RESEARCH', { web: true, maxOutputTokens: 2200 });
+        await afLogMetric(env, { request: true, search: true, latency: result.latency, tokens: result.tokens, model: result.model, mode: 'RESEARCH' });
+        return jsonResponse({ ok: true, answer: result.text, sources: result.sources || [], provider: result.provider, model: result.model, searched: true });
+    } catch (e) {
+        await afLogMetric(env, { request: true, search: true, error: true, mode: 'RESEARCH' });
+        return jsonResponse({ error: 'No pude completar la investigación ahora.' }, 502);
+    }
+}
+
+async function afReadFileAsText(data, mime) {
+    const clean = String(data || '').replace(/^data:[^;]+;base64,/, '');
+    if (!clean || !/^((text\/)|(application\/(json|csv)))$/i.test(String(mime || ''))) return null;
+    try {
+        const text = atob(clean);
+        return text.length <= 120000 ? text : text.slice(0, 120000);
+    } catch { return null; }
+}
+
+async function handleAirFlowFileSearchV11(env, request) {
+    const auth = await requireAuth(env, request);
+    if (!auth) return jsonResponse({ error: 'No autorizado' }, 403);
+    if (request.method !== 'GET') return jsonResponse({ error: 'Método no permitido' }, 405);
+    const safe = await hashKey(String(auth.user.email || '').toLowerCase());
+    const index = await env.STATS.get(`af_files_${safe}`, 'json') || [];
+    const q = String(new URL(request.url).searchParams.get('q') || '').trim().toLowerCase();
+    if (!q) return jsonResponse({ files: index.map(x => ({ id: x.id, name: x.name, mime: x.mime, created_at: x.created_at })) });
+    const results = [];
+    for (const item of index.slice(0, 20)) {
+        const stored = await env.STATS.get(`af_file_${safe}_${item.id}`, 'json');
+        const text = String(stored?.text || '').toLowerCase();
+        if (text.includes(q)) {
+            const pos = text.indexOf(q);
+            const original = String(stored?.text || '');
+            results.push({ id: item.id, name: item.name, excerpt: original.slice(Math.max(0, pos - 180), Math.min(original.length, pos + q.length + 240)) });
+        }
+        if (results.length >= 10) break;
+    }
+    return jsonResponse({ results });
+}
+
+async function handleAirFlowPlannerV11(env, request) {
+    const auth = await requireAuth(env, request);
+    if (!auth) return jsonResponse({ error: 'No autorizado' }, 403);
+    const safe = await hashKey(String(auth.user.email || '').toLowerCase());
+    const key = `af_planner_${safe}`;
+    const tasks = await env.STATS.get(key, 'json') || [];
+    if (request.method === 'GET') return jsonResponse({ tasks: tasks.slice(0, 100) });
+    if (request.method !== 'POST' && request.method !== 'DELETE') return jsonResponse({ error: 'Método no permitido' }, 405);
+    let body = {}; try { body = request.method === 'POST' ? await request.json() : {}; } catch { return jsonResponse({ error: 'JSON inválido' }, 400); }
+    if (request.method === 'DELETE') {
+        const id = String(new URL(request.url).searchParams.get('id') || '').trim();
+        if (!id) return jsonResponse({ error: 'Falta id.' }, 400);
+        const next = tasks.filter(x => x.id !== id);
+        await env.STATS.put(key, JSON.stringify(next), { expirationTtl: AF_MEMORY_TTL });
+        return jsonResponse({ tasks: next });
+    }
+    const action = String(body?.action || 'add');
+    if (action === 'complete') {
+        const id = String(body?.id || '');
+        const next = tasks.map(x => x.id === id ? { ...x, done: !x.done, updated_at: new Date().toISOString() } : x);
+        await env.STATS.put(key, JSON.stringify(next), { expirationTtl: AF_MEMORY_TTL });
+        return jsonResponse({ tasks: next });
+    }
+    const title = String(body?.title || '').trim().slice(0, 200);
+    if (!title) return jsonResponse({ error: 'Falta title.' }, 400);
+    const task = { id: crypto.randomUUID(), title, note: String(body?.note || '').slice(0, 1000), due: String(body?.due || '').slice(0, 80), done: false, created_at: new Date().toISOString() };
+    const next = [task, ...tasks].slice(0, 100);
+    await env.STATS.put(key, JSON.stringify(next), { expirationTtl: AF_MEMORY_TTL });
+    return jsonResponse({ task, tasks: next });
+}
+
+async function handleAirFlowCodeReviewV11(env, request) {
+    const auth = await requireAuth(env, request);
+    if (!auth) return jsonResponse({ error: 'No autorizado' }, 403);
+    if (request.method !== 'POST') return jsonResponse({ error: 'Método no permitido' }, 405);
+    if (!(await afRateLimit(env, request, auth.user.email, 'code'))) return jsonResponse({ error: 'Límite de código alcanzado.' }, 429);
+    let body; try { body = await request.json(); } catch { return jsonResponse({ error: 'JSON inválido' }, 400); }
+    const code = String(body?.code || '').slice(0, 50000);
+    const language = String(body?.language || 'text').slice(0, 40);
+    const question = String(body?.question || 'Revisa este código, detecta errores y propone mejoras seguras.').slice(0, 2500);
+    if (!code) return jsonResponse({ error: 'Falta código.' }, 400);
+    const localIssues = [];
+    const pairs = [['(',')'], ['{','}'], ['[',']']];
+    for (const [a,b] of pairs) {
+        const ca = (code.match(new RegExp(`\\${a}`, 'g')) || []).length;
+        const cb = (code.match(new RegExp(`\\${b}`, 'g')) || []).length;
+        if (ca !== cb) localIssues.push(`Posible desbalance de ${a}${b}: ${ca} vs ${cb}`);
+    }
+    try {
+        const prompt = `${question}\nLenguaje: ${language}\n\nCÓDIGO:\n${code}`;
+        const result = await afGenerate(env, [], prompt, 'CODE', { web: false, maxOutputTokens: 2200 });
+        return jsonResponse({ ok: true, review: result.text, local_issues: localIssues, provider: result.provider, model: result.model, execution: 'disabled_for_safety' });
+    } catch (e) {
+        return jsonResponse({ error: 'No pude revisar el código ahora.' }, 502);
+    }
+}
+
+async function handleAirFlowSecurityV11(env, request) {
+    const auth = await requireAuth(env, request);
+    if (!auth) return jsonResponse({ error: 'No autorizado' }, 403);
+    if (request.method !== 'GET') return jsonResponse({ error: 'Método no permitido' }, 405);
+    const perms = await env.STATS.get(`af_permissions_${await hashKey(String(auth.user.email || '').toLowerCase())}`, 'json') || { tools: {} };
+    const conversations = await afGetConversations(env, auth.user.email, '');
+    return jsonResponse({ permissions: perms, conversations_saved: conversations.length, sensitive_actions_require_confirmation: true, server_code_execution: false });
+}
+
+async function handleAirFlowPageV11(env, request) {
+    const auth = await requireAuth(env, request);
+    if (!auth) return Response.redirect(`${new URL(request.url).origin}/welcome`, 302);
+    const safeName = escapeHTML(auth.user.name || auth.user.email?.split('@')[0] || 'amigo');
+    const hasGemini = !!env.GEMINI_API_KEY;
+    const hasOpenRouter = !!env.OPENROUTER_API_KEY;
+    const providerLabel = hasGemini && hasOpenRouter ? 'Gemini + OpenRouter' : (hasGemini ? 'Gemini' : (hasOpenRouter ? 'OpenRouter' : 'Sin proveedor'));
+    return new Response(`<!DOCTYPE html><html lang="es"><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>✈️ Air Flow — Ocean Hub</title>
+<style>*{box-sizing:border-box}body{margin:0;background:#03050b;color:#fff;font-family:Inter,Segoe UI,system-ui,sans-serif;height:100vh;overflow:hidden}body:before{content:"";position:fixed;inset:-20%;background:radial-gradient(circle at 15% 15%,rgba(0,220,255,.14),transparent 28%),radial-gradient(circle at 85% 25%,rgba(125,80,255,.18),transparent 30%),radial-gradient(circle at 55% 95%,rgba(0,255,180,.08),transparent 30%);filter:blur(30px);pointer-events:none}.app{position:relative;z-index:1;height:100%;display:flex;max-width:1400px;margin:auto;padding:14px;gap:12px}.side{width:250px;border:1px solid rgba(255,255,255,.08);background:rgba(8,13,24,.72);backdrop-filter:blur(18px);border-radius:22px;padding:14px;display:flex;flex-direction:column;gap:12px}.brand{display:flex;gap:10px;align-items:center}.orb{width:42px;height:42px;border-radius:50%;background:conic-gradient(#00e5ff,#7c4dff,#00ffb3,#00e5ff);box-shadow:0 0 30px rgba(0,220,255,.28);display:grid;place-items:center;color:#041019;font-size:21px}.brand b{display:block}.brand small{color:#7d90a7}.nav{display:grid;gap:6px;margin-top:6px}.nav button,.side a{border:1px solid rgba(255,255,255,.07);background:rgba(255,255,255,.03);color:#c9d8e8;border-radius:12px;padding:10px;text-align:left;cursor:pointer;text-decoration:none;font:inherit}.nav button.active,.nav button:hover,.side a:hover{border-color:rgba(93,231,255,.35);background:rgba(0,220,255,.08);color:white}.side .foot{margin-top:auto;color:#74859b;font-size:.76rem;line-height:1.5}.main{flex:1;min-width:0;border:1px solid rgba(255,255,255,.08);background:rgba(7,11,20,.74);backdrop-filter:blur(18px);border-radius:22px;display:flex;flex-direction:column;overflow:hidden}.top{padding:16px 18px;border-bottom:1px solid rgba(255,255,255,.07);display:flex;justify-content:space-between;align-items:center;gap:10px}.top h1{margin:0;font-size:1.2rem}.status{font-size:.75rem;color:#6ee7c8}.hero{padding:22px 22px 12px}.hero h2{font-size:clamp(1.7rem,4vw,2.6rem);margin:0}.hero span{background:linear-gradient(90deg,#fff,#76eaff,#ae87ff);-webkit-background-clip:text;color:transparent}.hero p{color:#91a2b8;margin:6px 0}.messages{flex:1;overflow:auto;padding:10px 22px 20px;display:flex;flex-direction:column;gap:13px}.msg{max-width:min(850px,90%);padding:13px 15px;border-radius:18px;line-height:1.5;white-space:pre-wrap;word-break:break-word}.msg.user{align-self:flex-end;background:linear-gradient(135deg,#087ea0,#5b43c6);border-bottom-right-radius:5px}.msg.ai{align-self:flex-start;background:rgba(255,255,255,.05);border:1px solid rgba(255,255,255,.07);border-bottom-left-radius:5px}.meta{font-size:.67rem;color:#7f91a6;margin-bottom:5px}.sources{margin-top:10px;font-size:.78rem}.sources a{color:#8eefff;display:block;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}.tools{display:flex;gap:6px;flex-wrap:wrap;padding:0 18px 10px}.pill{border:1px solid rgba(255,255,255,.1);background:rgba(255,255,255,.03);color:#b8c8da;border-radius:999px;padding:7px 10px;font-size:.74rem;cursor:pointer}.pill.active{border-color:#55e5ff;background:rgba(0,220,255,.12);color:#fff}.composer{padding:12px 14px;display:flex;gap:9px;border-top:1px solid rgba(255,255,255,.07)}textarea{flex:1;resize:none;min-height:52px;max-height:150px;border:1px solid rgba(255,255,255,.1);border-radius:16px;background:rgba(0,0,0,.26);color:white;padding:13px;font:inherit;outline:none}textarea:focus{border-color:#56e5ff}.send{width:54px;height:52px;border:0;border-radius:16px;background:linear-gradient(135deg,#00d9ff,#7857ff);font-size:20px;font-weight:800;cursor:pointer}.mini{display:flex;gap:6px;align-items:center}.hide{display:none!important}.panel{position:fixed;inset:8%;z-index:5;background:#07101c;border:1px solid rgba(255,255,255,.1);border-radius:20px;box-shadow:0 30px 100px rgba(0,0,0,.55);padding:20px;overflow:auto}.close{float:right;border:0;background:transparent;color:#fff;font-size:22px;cursor:pointer}.panel h3{margin-top:0}.drop{padding:16px;border:1px dashed rgba(255,255,255,.16);border-radius:14px;margin:10px 0}.result{background:rgba(255,255,255,.04);padding:12px;border-radius:12px;margin-top:8px;white-space:pre-wrap}.feedback{display:flex;gap:5px;margin-top:7px}.feedback button{border:0;background:rgba(255,255,255,.06);color:#9eb0c5;border-radius:9px;padding:5px 8px;cursor:pointer}@media(max-width:900px){.side{display:none}.app{padding:8px}.main{border-radius:16px}.hero{padding:16px}.messages{padding:8px 14px 16px}}</style></head>
+<body><div class="app"><aside class="side"><div class="brand"><div class="orb">✈</div><div><b>Air Flow</b><small>Ocean Hub AI</small></div></div><div class="nav"><button class="active" data-mode="QUICK">⚡ Chat</button><button data-mode="RESEARCH">🌐 Research</button><button data-mode="CODE">💻 Code</button><button data-mode="STUDY">📚 Study</button><button data-mode="GAMING">🎮 Gaming</button><button data-mode="TRAVEL">✈️ Travel</button><button data-mode="PLANNER">📅 Planner</button><button data-mode="AGENT">🤖 Agent</button><button data-action="vision">👁️ Vision</button><button data-action="files">📎 Files</button><button data-action="memory">🧠 Memory</button><button data-action="live">🎙️ Live</button><button data-action="create">🎨 Create</button></div><div class="foot">${escapeHTML(providerLabel)}<br>Hola, ${safeName}.<br><a href="/home">← Volver a Ocean Hub</a></div></aside>
+<main class="main"><div class="top"><div><h1>✈️ Air Flow</h1><div class="status">● ${escapeHTML(providerLabel)}</div></div><div class="mini"><button class="pill" id="new">＋ Nuevo</button><button class="pill" id="history">🕘 Historial</button></div></div><div class="hero"><h2>Tu <span>Air Flow</span>, ${safeName}.</h2><p>Directo, natural y con tu ritmo. ✈️</p></div><div id="messages" class="messages"><div id="empty" class="msg ai">¿Qué hacemos? Puedo conversar, investigar en la web, analizar imágenes/archivos y ayudarte con código, estudio, viajes y proyectos.</div></div><div class="tools"><button class="pill active" data-mode="QUICK">⚡ Quick</button><button class="pill" data-mode="THINK">🧠 Think</button><button class="pill" data-mode="RESEARCH">🌐 Research</button><button class="pill" data-mode="CODE">💻 Code</button><button class="pill" data-mode="STUDY">📚 Study</button><button class="pill" data-mode="GAMING">🎮 Gaming</button><button class="pill" data-mode="TRAVEL">✈️ Travel</button><button class="pill" data-mode="SHOPPING">🛒 Shopping</button><button class="pill" data-mode="AGENT">🤖 Agent</button></div><div class="composer"><textarea id="input" maxlength="${AF_MAX_MESSAGE_CHARS}" placeholder="Pregunta lo que quieras..."></textarea><input id="file" type="file" class="hide"><button id="attach" class="pill" title="Archivo">📎</button><button id="cam" class="pill" title="Cámara">📷</button><button id="send" class="send">➤</button></div></main></div><div id="panel" class="panel hide"></div>
+<script>
+let mode='QUICK',history=[],busy=false;const msgBox=document.getElementById('messages'),input=document.getElementById('input'),send=document.getElementById('send'),file=document.getElementById('file'),panel=document.getElementById('panel');
+function esc(s){const d=document.createElement('div');d.textContent=s;return d.innerHTML}
+function add(role,text,sources=[]){const d=document.createElement('div');d.className='msg '+(role==='user'?'user':'ai');const m=document.createElement('div');m.className='meta';m.textContent=role==='user'?'TÚ':'AIR FLOW';const t=document.createElement('div');t.textContent=text;d.append(m,t);if(sources?.length){const box=document.createElement('div');box.className='sources';sources.forEach(x=>{const a=document.createElement('a');a.href=x.url;a.target='_blank';a.rel='noopener noreferrer';a.textContent='🔗 '+(x.title||x.url);box.appendChild(a)});d.appendChild(box)}if(role!=='user'){const f=document.createElement('div');f.className='feedback';['up','down'].forEach(v=>{const b=document.createElement('button');b.textContent=v==='up'?'👍':'👎';b.onclick=()=>fetch('/air-flow/feedback',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({feedback:v,mode})});f.appendChild(b)});d.appendChild(f)}msgBox.appendChild(d);msgBox.scrollTop=msgBox.scrollHeight;return d}
+async function sendMsg(){const text=input.value.trim();if(!text||busy)return;if(mode==='AGENT'){return agent(text)}input.value='';add('user',text);busy=true;send.disabled=true;const wait=add('assistant','Air Flow está pensando…');try{const r=await fetch('/air-flow/chat',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({message:text,history,mode})});const data=await r.json().catch(()=>({}));wait.remove();if(!r.ok)throw new Error(data.error||'No pude responder.');add('assistant',data.reply||'',data.sources||[]);history.push({role:'user',content:text},{role:'assistant',content:data.reply||''});history=history.slice(-16)}catch(e){wait.remove();add('assistant','⚠️ '+(e.message||'Error inesperado.'))}finally{busy=false;send.disabled=false;input.focus()}}
+async function agent(goal){add('user',goal);busy=true;try{const r=await fetch('/air-flow/agent',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({goal})});const d=await r.json();add('assistant',(d.plan||[]).map((x,i)=>(i+1)+'. '+x.label).join('\n')+'\n\nConfirma con 🤖 Agent → Ejecutar desde el panel para comenzar.');showPanel('<button class="close" onclick="closePanel()">×</button><h3>🤖 Air Flow Agent</h3><div class="result">'+esc(JSON.stringify(d.plan||[],null,2))+'</div><button class="pill" onclick="approveAgent('+JSON.stringify(goal).replace(/</g,'\\u003c')+')">✅ Ejecutar plan</button>')}finally{busy=false}}
+async function approveAgent(goal){closePanel();const r=await fetch('/air-flow/agent',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({goal,approve:true})});const d=await r.json();add('assistant',JSON.stringify(d.results||d,null,2));}
+function showPanel(html){panel.innerHTML=html;panel.classList.remove('hide')}function closePanel(){panel.classList.add('hide');panel.innerHTML=''}
+async function memoryPanel(){const r=await fetch('/air-flow/memory');const d=await r.json();showPanel('<button class="close" onclick="closePanel()">×</button><h3>🧠 Memoria de Air Flow</h3><p>Solo guarda lo que tú decidas.</p><div class="result">'+esc(JSON.stringify(d.memory||{},null,2))+'</div><button class="pill" onclick="clearMem()">🗑️ Borrar memoria permanente</button>')}async function clearMem(){await fetch('/air-flow/memory',{method:'DELETE'});closePanel();add('assistant','🧠 Memoria permanente eliminada.')}
+async function vision(fileObj){const b64=await new Promise((res,rej)=>{const fr=new FileReader();fr.onload=()=>res(fr.result);fr.onerror=rej;fr.readAsDataURL(fileObj)});showPanel('<button class="close" onclick="closePanel()">×</button><h3>👁️ Air Flow Vision</h3><textarea id="vp" style="width:100%;min-height:90px;background:#0c1624;color:white;border:1px solid #234;padding:10px;border-radius:10px" placeholder="¿Qué quieres saber de la imagen?"></textarea><button class="pill" onclick="runVision('+JSON.stringify(b64)+','+JSON.stringify(fileObj.type)+')">Analizar</button><div id="vr"></div>')}async function runVision(b64,mime){const p=document.getElementById('vp').value||'Analiza esta imagen y transcribe el texto importante.';const r=await fetch('/air-flow/vision',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({prompt:p,image:{data:b64,mimeType:mime}})});const d=await r.json();document.getElementById('vr').innerHTML='<div class="result">'+esc(d.reply||d.error||'')+'</div>'}
+async function filesPanel(f){const b64=await new Promise((res,rej)=>{const fr=new FileReader();fr.onload=()=>res(fr.result);fr.onerror=rej;fr.readAsDataURL(f)});showPanel('<button class="close" onclick="closePanel()">×</button><h3>📎 Air Flow Files</h3><p>'+esc(f.name)+'</p><textarea id="fp" style="width:100%;min-height:90px;background:#0c1624;color:white;border:1px solid #234;padding:10px;border-radius:10px" placeholder="¿Qué quieres que haga con el archivo?"></textarea><button class="pill" onclick="runFile('+JSON.stringify(b64)+','+JSON.stringify(f.type)+','+JSON.stringify(f.name)+')">Analizar</button><div id="fr"></div>')}async function runFile(b64,mime,name){const p=document.getElementById('fp').value||'Resume y analiza este archivo.';const r=await fetch('/air-flow/file',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({prompt:p,file:{data:b64,mimeType:mime,name}})});const d=await r.json();document.getElementById('fr').innerHTML='<div class="result">'+esc(d.reply||d.error||'')+'</div>'}
+async function livePanel(){const r=await fetch('/air-flow/live/token',{method:'POST'});const d=await r.json();showPanel('<button class="close" onclick="closePanel()">×</button><h3>🎙️ Air Flow Live</h3><div class="result">'+esc(d.error||'Token Live listo. Conexión WebSocket: '+(d.websocket||''))+'</div><p style="color:#9ab">El token es temporal y se usa para conectar el cliente al Live API.</p>')}
+async function createPanel(){showPanel('<button class="close" onclick="closePanel()">×</button><h3>🎨 Air Flow Create</h3><textarea id="cp" style="width:100%;min-height:110px;background:#0c1624;color:white;border:1px solid #234;padding:10px;border-radius:10px" placeholder="Describe la imagen que quieres crear..."></textarea><button class="pill" onclick="createImage()">Generar</button><div id="cr"></div>')}async function createImage(){const p=document.getElementById('cp').value;const r=await fetch('/air-flow/create/image',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({prompt:p})});const d=await r.json();if(d.data){document.getElementById('cr').innerHTML='<img style="max-width:100%;border-radius:14px;margin-top:12px" src="data:'+(d.mimeType||'image/png')+';base64,'+d.data+'">'}else document.getElementById('cr').innerHTML='<div class="result">'+esc(d.error||'Error')+'</div>'}
+document.querySelectorAll('[data-mode]').forEach(b=>b.onclick=()=>{mode=b.dataset.mode;document.querySelectorAll('[data-mode]').forEach(x=>x.classList.toggle('active',x.dataset.mode===mode))});document.querySelectorAll('[data-action]').forEach(b=>b.onclick=()=>{const a=b.dataset.action;if(a==='memory')memoryPanel();if(a==='live')livePanel();if(a==='create')createPanel();if(a==='vision')file.click();if(a==='files')file.click()});document.getElementById('new').onclick=()=>{history=[];msgBox.innerHTML='<div id="empty" class="msg ai">Nueva conversación. ✈️</div>'};document.getElementById('history').onclick=async()=>{const r=await fetch('/air-flow/conversations');const d=await r.json();showPanel('<button class="close" onclick="closePanel()">×</button><h3>🕘 Historial</h3>'+((d.conversations||[]).map(x=>'<div class="drop"><b>'+esc(x.title)+'</b><div style="color:#789">'+esc(x.mode||'')+'</div></div>').join('')||'<p>Sin conversaciones guardadas.</p>'))};document.getElementById('attach').onclick=()=>file.click();file.onchange=()=>{const f=file.files[0];if(!f)return;filesPanel(f)};document.getElementById('cam').onclick=()=>file.click();send.onclick=sendMsg;input.addEventListener('keydown',e=>{if(e.key==='Enter'&&!e.shiftKey){e.preventDefault();sendMsg()}});input.focus();
+</script></body></html>`, { headers: { 'Content-Type': 'text/html; charset=utf-8' } });
 }
 
 async function handleHome(env) {
@@ -6804,8 +7460,26 @@ export async function workerFetch(request, env) {
 
         // --- Rutas web ---
         if (path === '/' || path === '/home') return await handleHome(env);
-        if (path === '/air-flow') return await handleAirFlowPage(env, request);
-        if (path === '/air-flow/chat') return await handleAirFlowChat(env, request);
+        if (path === '/air-flow') return await handleAirFlowPageV11(env, request);
+        if (path === '/air-flow/chat') return await handleAirFlowChatV11(env, request);
+        if (path === '/air-flow/vision') return await handleAirFlowVisionV11(env, request);
+        if (path === '/air-flow/file') return await handleAirFlowFileV11(env, request);
+        if (path === '/air-flow/memory') return await handleAirFlowMemoryV11(env, request);
+        if (path === '/air-flow/conversations') return await handleAirFlowConversationsV11(env, request);
+        if (path === '/air-flow/feedback') return await handleAirFlowFeedbackV11(env, request);
+        if (path === '/air-flow/agent') return await handleAirFlowAgentV11(env, request);
+        if (path.startsWith('/air-flow/artifact/')) return await handleAirFlowArtifactV11(env, request);
+        if (path === '/air-flow/create/image') return await handleAirFlowCreateImageV11(env, request);
+        if (path === '/air-flow/live/token') return await handleAirFlowLiveTokenV11(env, request);
+        if (path === '/air-flow/permissions') return await handleAirFlowPermissionsV11(env, request);
+        if (path === '/air-flow/status') return await handleAirFlowStatusV11(env, request);
+        if (path === '/air-flow/research') return await handleAirFlowResearchV11(env, request);
+        if (path === '/air-flow/files/search') return await handleAirFlowFileSearchV11(env, request);
+        if (path === '/air-flow/planner') return await handleAirFlowPlannerV11(env, request);
+        if (path === '/air-flow/code/review') return await handleAirFlowCodeReviewV11(env, request);
+        if (path === '/air-flow/security') return await handleAirFlowSecurityV11(env, request);
+        if (path === '/admin/air-flow') return await handleAirFlowAdminV11(env, request);
+        if (path === '/admin/air-flow/personality') return await handleAirFlowPersonalityLabV11(env, request);
         if (path === '/shop') return await handleShop(env, request);
         if (path === '/pay') return await handlePay();
         if (path === '/sell') return await handleSell(env, request);
