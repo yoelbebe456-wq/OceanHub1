@@ -1,7 +1,7 @@
 {
   "$schema": "./node_modules/wrangler/config-schema.json",
   "name": "oceanhud",
-  "main": "OceanHub_SECURITY_PATCHED_FINAL_v10.js",
+  "main": "OceanHub_SECURITY_PATCHED_FINAL_v11.js",
   "compatibility_date": "2026-09-27",
 
   "vars": {
