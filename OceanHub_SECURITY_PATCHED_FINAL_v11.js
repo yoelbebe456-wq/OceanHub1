@@ -3783,8 +3783,9 @@ async function handleAirFlowChatV11(env, request) {
         return jsonResponse({ reply: result.text, provider: result.provider, model: result.model, sources: result.sources || [], searched: !!result.searched, mode });
     } catch (error) {
         await afLogMetric(env, { request: true, error: true, latency: Date.now() - started, mode });
+        const code = String(error?.message || 'AIR_FLOW_NO_PROVIDER').replace(/[^A-Z0-9_\-]/g, '').slice(0, 80) || 'AIR_FLOW_NO_PROVIDER';
         console.error('Air Flow V11 chat failed:', error?.message || error);
-        return jsonResponse({ error: '⚠️ Air Flow no pudo responder ahora. Revisa los proveedores configurados.' }, 502);
+        return jsonResponse({ error: '⚠️ Air Flow no pudo responder ahora.', code }, 502);
     }
 }
 
@@ -4286,19 +4287,179 @@ async function handleAirFlowPageV11(env, request) {
 <body><div class="app"><aside class="side"><div class="brand"><div class="orb">✈</div><div><b>Air Flow</b><small>Ocean Hub AI</small></div></div><div class="nav"><button class="active" data-mode="QUICK">⚡ Chat</button><button data-mode="RESEARCH">🌐 Research</button><button data-mode="CODE">💻 Code</button><button data-mode="STUDY">📚 Study</button><button data-mode="GAMING">🎮 Gaming</button><button data-mode="TRAVEL">✈️ Travel</button><button data-mode="PLANNER">📅 Planner</button><button data-mode="AGENT">🤖 Agent</button><button data-action="vision">👁️ Vision</button><button data-action="files">📎 Files</button><button data-action="memory">🧠 Memory</button><button data-action="live">🎙️ Live</button><button data-action="create">🎨 Create</button></div><div class="foot">${escapeHTML(providerLabel)}<br>Hola, ${safeName}.<br><a href="/home">← Volver a Ocean Hub</a></div></aside>
 <main class="main"><div class="top"><div><h1>✈️ Air Flow</h1><div class="status">● ${escapeHTML(providerLabel)}</div></div><div class="mini"><button class="pill" id="new">＋ Nuevo</button><button class="pill" id="history">🕘 Historial</button></div></div><div class="hero"><h2>Tu <span>Air Flow</span>, ${safeName}.</h2><p>Directo, natural y con tu ritmo. ✈️</p></div><div id="messages" class="messages"><div id="empty" class="msg ai">¿Qué hacemos? Puedo conversar, investigar en la web, analizar imágenes/archivos y ayudarte con código, estudio, viajes y proyectos.</div></div><div class="tools"><button class="pill active" data-mode="QUICK">⚡ Quick</button><button class="pill" data-mode="THINK">🧠 Think</button><button class="pill" data-mode="RESEARCH">🌐 Research</button><button class="pill" data-mode="CODE">💻 Code</button><button class="pill" data-mode="STUDY">📚 Study</button><button class="pill" data-mode="GAMING">🎮 Gaming</button><button class="pill" data-mode="TRAVEL">✈️ Travel</button><button class="pill" data-mode="SHOPPING">🛒 Shopping</button><button class="pill" data-mode="AGENT">🤖 Agent</button></div><div class="composer"><textarea id="input" maxlength="${AF_MAX_MESSAGE_CHARS}" placeholder="Pregunta lo que quieras..."></textarea><input id="file" type="file" class="hide"><button id="attach" class="pill" title="Archivo">📎</button><button id="cam" class="pill" title="Cámara">📷</button><button id="send" class="send">➤</button></div></main></div><div id="panel" class="panel hide"></div>
 <script>
-let mode='QUICK',history=[],busy=false;const msgBox=document.getElementById('messages'),input=document.getElementById('input'),send=document.getElementById('send'),file=document.getElementById('file'),panel=document.getElementById('panel');
-function esc(s){const d=document.createElement('div');d.textContent=s;return d.innerHTML}
-function add(role,text,sources=[]){const d=document.createElement('div');d.className='msg '+(role==='user'?'user':'ai');const m=document.createElement('div');m.className='meta';m.textContent=role==='user'?'TÚ':'AIR FLOW';const t=document.createElement('div');t.textContent=text;d.append(m,t);if(sources?.length){const box=document.createElement('div');box.className='sources';sources.forEach(x=>{const a=document.createElement('a');a.href=x.url;a.target='_blank';a.rel='noopener noreferrer';a.textContent='🔗 '+(x.title||x.url);box.appendChild(a)});d.appendChild(box)}if(role!=='user'){const f=document.createElement('div');f.className='feedback';['up','down'].forEach(v=>{const b=document.createElement('button');b.textContent=v==='up'?'👍':'👎';b.onclick=()=>fetch('/air-flow/feedback',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({feedback:v,mode})});f.appendChild(b)});d.appendChild(f)}msgBox.appendChild(d);msgBox.scrollTop=msgBox.scrollHeight;return d}
-async function sendMsg(){const text=input.value.trim();if(!text||busy)return;if(mode==='AGENT'){return agent(text)}input.value='';add('user',text);busy=true;send.disabled=true;const wait=add('assistant','Air Flow está pensando…');try{const r=await fetch('/air-flow/chat',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({message:text,history,mode})});const data=await r.json().catch(()=>({}));wait.remove();if(!r.ok)throw new Error(data.error||'No pude responder.');add('assistant',data.reply||'',data.sources||[]);history.push({role:'user',content:text},{role:'assistant',content:data.reply||''});history=history.slice(-16)}catch(e){wait.remove();add('assistant','⚠️ '+(e.message||'Error inesperado.'))}finally{busy=false;send.disabled=false;input.focus()}}
-async function agent(goal){add('user',goal);busy=true;try{const r=await fetch('/air-flow/agent',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({goal})});const d=await r.json();add('assistant',(d.plan||[]).map((x,i)=>(i+1)+'. '+x.label).join('\n')+'\n\nConfirma con 🤖 Agent → Ejecutar desde el panel para comenzar.');showPanel('<button class="close" onclick="closePanel()">×</button><h3>🤖 Air Flow Agent</h3><div class="result">'+esc(JSON.stringify(d.plan||[],null,2))+'</div><button class="pill" onclick="approveAgent('+JSON.stringify(goal).replace(/</g,'\\u003c')+')">✅ Ejecutar plan</button>')}finally{busy=false}}
-async function approveAgent(goal){closePanel();const r=await fetch('/air-flow/agent',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({goal,approve:true})});const d=await r.json();add('assistant',JSON.stringify(d.results||d,null,2));}
-function showPanel(html){panel.innerHTML=html;panel.classList.remove('hide')}function closePanel(){panel.classList.add('hide');panel.innerHTML=''}
-async function memoryPanel(){const r=await fetch('/air-flow/memory');const d=await r.json();showPanel('<button class="close" onclick="closePanel()">×</button><h3>🧠 Memoria de Air Flow</h3><p>Solo guarda lo que tú decidas.</p><div class="result">'+esc(JSON.stringify(d.memory||{},null,2))+'</div><button class="pill" onclick="clearMem()">🗑️ Borrar memoria permanente</button>')}async function clearMem(){await fetch('/air-flow/memory',{method:'DELETE'});closePanel();add('assistant','🧠 Memoria permanente eliminada.')}
-async function vision(fileObj){const b64=await new Promise((res,rej)=>{const fr=new FileReader();fr.onload=()=>res(fr.result);fr.onerror=rej;fr.readAsDataURL(fileObj)});showPanel('<button class="close" onclick="closePanel()">×</button><h3>👁️ Air Flow Vision</h3><textarea id="vp" style="width:100%;min-height:90px;background:#0c1624;color:white;border:1px solid #234;padding:10px;border-radius:10px" placeholder="¿Qué quieres saber de la imagen?"></textarea><button class="pill" onclick="runVision('+JSON.stringify(b64)+','+JSON.stringify(fileObj.type)+')">Analizar</button><div id="vr"></div>')}async function runVision(b64,mime){const p=document.getElementById('vp').value||'Analiza esta imagen y transcribe el texto importante.';const r=await fetch('/air-flow/vision',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({prompt:p,image:{data:b64,mimeType:mime}})});const d=await r.json();document.getElementById('vr').innerHTML='<div class="result">'+esc(d.reply||d.error||'')+'</div>'}
-async function filesPanel(f){const b64=await new Promise((res,rej)=>{const fr=new FileReader();fr.onload=()=>res(fr.result);fr.onerror=rej;fr.readAsDataURL(f)});showPanel('<button class="close" onclick="closePanel()">×</button><h3>📎 Air Flow Files</h3><p>'+esc(f.name)+'</p><textarea id="fp" style="width:100%;min-height:90px;background:#0c1624;color:white;border:1px solid #234;padding:10px;border-radius:10px" placeholder="¿Qué quieres que haga con el archivo?"></textarea><button class="pill" onclick="runFile('+JSON.stringify(b64)+','+JSON.stringify(f.type)+','+JSON.stringify(f.name)+')">Analizar</button><div id="fr"></div>')}async function runFile(b64,mime,name){const p=document.getElementById('fp').value||'Resume y analiza este archivo.';const r=await fetch('/air-flow/file',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({prompt:p,file:{data:b64,mimeType:mime,name}})});const d=await r.json();document.getElementById('fr').innerHTML='<div class="result">'+esc(d.reply||d.error||'')+'</div>'}
-async function livePanel(){const r=await fetch('/air-flow/live/token',{method:'POST'});const d=await r.json();showPanel('<button class="close" onclick="closePanel()">×</button><h3>🎙️ Air Flow Live</h3><div class="result">'+esc(d.error||'Token Live listo. Conexión WebSocket: '+(d.websocket||''))+'</div><p style="color:#9ab">El token es temporal y se usa para conectar el cliente al Live API.</p>')}
-async function createPanel(){showPanel('<button class="close" onclick="closePanel()">×</button><h3>🎨 Air Flow Create</h3><textarea id="cp" style="width:100%;min-height:110px;background:#0c1624;color:white;border:1px solid #234;padding:10px;border-radius:10px" placeholder="Describe la imagen que quieres crear..."></textarea><button class="pill" onclick="createImage()">Generar</button><div id="cr"></div>')}async function createImage(){const p=document.getElementById('cp').value;const r=await fetch('/air-flow/create/image',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({prompt:p})});const d=await r.json();if(d.data){document.getElementById('cr').innerHTML='<img style="max-width:100%;border-radius:14px;margin-top:12px" src="data:'+(d.mimeType||'image/png')+';base64,'+d.data+'">'}else document.getElementById('cr').innerHTML='<div class="result">'+esc(d.error||'Error')+'</div>'}
-document.querySelectorAll('[data-mode]').forEach(b=>b.onclick=()=>{mode=b.dataset.mode;document.querySelectorAll('[data-mode]').forEach(x=>x.classList.toggle('active',x.dataset.mode===mode))});document.querySelectorAll('[data-action]').forEach(b=>b.onclick=()=>{const a=b.dataset.action;if(a==='memory')memoryPanel();if(a==='live')livePanel();if(a==='create')createPanel();if(a==='vision')file.click();if(a==='files')file.click()});document.getElementById('new').onclick=()=>{history=[];msgBox.innerHTML='<div id="empty" class="msg ai">Nueva conversación. ✈️</div>'};document.getElementById('history').onclick=async()=>{const r=await fetch('/air-flow/conversations');const d=await r.json();showPanel('<button class="close" onclick="closePanel()">×</button><h3>🕘 Historial</h3>'+((d.conversations||[]).map(x=>'<div class="drop"><b>'+esc(x.title)+'</b><div style="color:#789">'+esc(x.mode||'')+'</div></div>').join('')||'<p>Sin conversaciones guardadas.</p>'))};document.getElementById('attach').onclick=()=>file.click();file.onchange=()=>{const f=file.files[0];if(!f)return;filesPanel(f)};document.getElementById('cam').onclick=()=>file.click();send.onclick=sendMsg;input.addEventListener('keydown',e=>{if(e.key==='Enter'&&!e.shiftKey){e.preventDefault();sendMsg()}});input.focus();
+let mode='QUICK',conversationHistory=[],busy=false,filePurpose='files',liveSocket=null;
+const msgBox=document.getElementById('messages'),input=document.getElementById('input'),send=document.getElementById('send'),file=document.getElementById('file'),panel=document.getElementById('panel');
+
+function esc(s){const d=document.createElement('div');d.textContent=String(s??'');return d.innerHTML}
+function showPanel(html=''){panel.innerHTML=html;panel.classList.remove('hide');return panel}
+function closePanel(){panel.classList.add('hide');panel.innerHTML=''}
+function showError(title,message){showPanel('<button class="close" id="panelClose" type="button">×</button><h3>'+esc(title)+'</h3><div class="result">'+esc(message)+'</div>');document.getElementById('panelClose')?.addEventListener('click',closePanel)}
+function removeEmpty(){document.getElementById('empty')?.remove()}
+
+async function fetchJSON(url,options={}){
+    let response;
+    try{response=await fetch(url,options)}catch(e){throw new Error('No se pudo conectar con Ocean Hub. Comprueba tu conexión.')} 
+    const type=response.headers.get('content-type')||'';
+    let data={};
+    if(type.includes('application/json')) data=await response.json().catch(()=>({}));
+    else {const text=await response.text().catch(()=> '');data={error:text.replace(/<[^>]+>/g,' ').replace(/\s+/g,' ').trim().slice(0,500)}}
+    if(!response.ok) throw new Error(data.error||data.code||('HTTP '+response.status));
+    return data;
+}
+
+function add(role,text,sources=[]){
+    removeEmpty();
+    const d=document.createElement('div');d.className='msg '+(role==='user'?'user':'ai');
+    const m=document.createElement('div');m.className='meta';m.textContent=role==='user'?'TÚ':'AIR FLOW';
+    const t=document.createElement('div');t.textContent=String(text??'');d.append(m,t);
+    if(Array.isArray(sources)&&sources.length){
+        const box=document.createElement('div');box.className='sources';
+        sources.forEach(x=>{if(!x?.url)return;const a=document.createElement('a');a.href=String(x.url);a.target='_blank';a.rel='noopener noreferrer';a.textContent='🔗 '+String(x.title||x.url);box.appendChild(a)});
+        d.appendChild(box);
+    }
+    if(role!=='user'){
+        const f=document.createElement('div');f.className='feedback';
+        [['up','👍'],['down','👎']].forEach(([v,label])=>{const b=document.createElement('button');b.type='button';b.textContent=label;b.addEventListener('click',async()=>{try{b.disabled=true;await fetchJSON('/air-flow/feedback',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({feedback:v,mode})})}catch(_){}});f.appendChild(b)});
+        d.appendChild(f);
+    }
+    msgBox.appendChild(d);msgBox.scrollTop=msgBox.scrollHeight;return d;
+}
+
+async function sendMsg(){
+    const text=input.value.trim();
+    if(!text||busy)return;
+    if(mode==='AGENT')return agent(text);
+    input.value='';add('user',text);busy=true;send.disabled=true;
+    const wait=add('assistant','Air Flow está pensando…');
+    try{
+        const data=await fetchJSON('/air-flow/chat',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({message:text,history:conversationHistory,mode})});
+        wait.remove();
+        add('assistant',data.reply||'No recibí una respuesta.',data.sources||[]);
+        conversationHistory.push({role:'user',content:text},{role:'assistant',content:data.reply||''});
+        conversationHistory=conversationHistory.slice(-16);
+    }catch(e){
+        wait.remove();add('assistant','⚠️ '+(e.message||'Error inesperado.'));
+    }finally{busy=false;send.disabled=false;input.focus()}
+}
+
+async function agent(goal){
+    add('user',goal);busy=true;
+    try{
+        const d=await fetchJSON('/air-flow/agent',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({goal})});
+        const plan=Array.isArray(d.plan)?d.plan:[];
+        add('assistant',plan.length?plan.map((x,i)=>(i+1)+'. '+x.label).join('\n'):'No se pudo crear un plan.');
+        showPanel('<button class="close" id="agentClose" type="button">×</button><h3>🤖 Air Flow Agent</h3><div class="result">'+esc(JSON.stringify(plan,null,2))+'</div><button class="pill" id="approveAgentBtn" type="button">✅ Ejecutar plan</button>');
+        document.getElementById('agentClose')?.addEventListener('click',closePanel);
+        document.getElementById('approveAgentBtn')?.addEventListener('click',()=>approveAgent(goal));
+    }catch(e){add('assistant','⚠️ '+(e.message||'No pude crear el plan.'))}
+    finally{busy=false}
+}
+
+async function approveAgent(goal){
+    closePanel();
+    try{const d=await fetchJSON('/air-flow/agent',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({goal,approve:true})});add('assistant',JSON.stringify(d.results??d,null,2))}
+    catch(e){add('assistant','⚠️ '+(e.message||'No pude ejecutar el plan.'))}
+}
+
+async function memoryPanel(){
+    try{
+        const d=await fetchJSON('/air-flow/memory');
+        showPanel('<button class="close" id="memoryClose" type="button">×</button><h3>🧠 Memoria de Air Flow</h3><p>Solo guarda lo que tú decidas.</p><div class="result">'+esc(JSON.stringify(d.memory||{},null,2))+'</div><button class="pill" id="clearMemBtn" type="button">🗑️ Borrar memoria permanente</button>');
+        document.getElementById('memoryClose')?.addEventListener('click',closePanel);document.getElementById('clearMemBtn')?.addEventListener('click',clearMem);
+    }catch(e){showError('🧠 Memoria',e.message||'No se pudo cargar la memoria.')}
+}
+async function clearMem(){try{await fetchJSON('/air-flow/memory',{method:'DELETE'});closePanel();add('assistant','🧠 Memoria permanente eliminada.')}catch(e){showError('🧠 Memoria',e.message||'No se pudo borrar la memoria.')}}
+
+async function vision(fileObj){
+    if(!fileObj||!String(fileObj.type||'').startsWith('image/')){showError('👁️ Vision','Selecciona una imagen válida.');return}
+    try{
+        const b64=await new Promise((res,rej)=>{const fr=new FileReader();fr.onload=()=>res(fr.result);fr.onerror=()=>rej(new Error('No pude leer la imagen.'));fr.readAsDataURL(fileObj)});
+        showPanel('<button class="close" id="visionClose" type="button">×</button><h3>👁️ Air Flow Vision</h3><p>'+esc(fileObj.name||'Imagen')+'</p><textarea id="vp" style="width:100%;min-height:90px;background:#0c1624;color:white;border:1px solid #234;padding:10px;border-radius:10px" placeholder="¿Qué quieres saber de la imagen?"></textarea><button class="pill" id="visionRunBtn" type="button">Analizar</button><div id="vr"></div>');
+        document.getElementById('visionClose')?.addEventListener('click',closePanel);
+        document.getElementById('visionRunBtn')?.addEventListener('click',()=>runVision(b64,fileObj.type));
+    }catch(e){showError('👁️ Vision',e.message||'No pude leer la imagen.')}
+}
+async function runVision(b64,mime){
+    const result=document.getElementById('vr');if(!result)return;
+    result.innerHTML='<div class="result">Analizando…</div>';
+    try{const p=document.getElementById('vp')?.value?.trim()||'Analiza esta imagen y transcribe el texto importante.';const d=await fetchJSON('/air-flow/vision',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({prompt:p,image:{data:b64,mimeType:mime}})});result.innerHTML='<div class="result">'+esc(d.reply||'No recibí un resultado.')+'</div>'}
+    catch(e){result.innerHTML='<div class="result">⚠️ '+esc(e.message||'No pude analizar la imagen.')+'</div>'}
+}
+
+async function filesPanel(f){
+    if(!f){return}
+    try{
+        const b64=await new Promise((res,rej)=>{const fr=new FileReader();fr.onload=()=>res(fr.result);fr.onerror=()=>rej(new Error('No pude leer el archivo.'));fr.readAsDataURL(f)});
+        showPanel('<button class="close" id="fileClose" type="button">×</button><h3>📎 Air Flow Files</h3><p>'+esc(f.name)+'</p><textarea id="fp" style="width:100%;min-height:90px;background:#0c1624;color:white;border:1px solid #234;padding:10px;border-radius:10px" placeholder="¿Qué quieres que haga con el archivo?"></textarea><button class="pill" id="fileRunBtn" type="button">Analizar</button><div id="fr"></div>');
+        document.getElementById('fileClose')?.addEventListener('click',closePanel);document.getElementById('fileRunBtn')?.addEventListener('click',()=>runFile(b64,f.type||'application/octet-stream',f.name||'archivo'));
+    }catch(e){showError('📎 Files',e.message||'No pude leer el archivo.')}
+}
+async function runFile(b64,mime,name){
+    const result=document.getElementById('fr');if(!result)return;result.innerHTML='<div class="result">Analizando…</div>';
+    try{const p=document.getElementById('fp')?.value?.trim()||'Resume y analiza este archivo.';const d=await fetchJSON('/air-flow/file',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({prompt:p,file:{data:b64,mimeType:mime,name}})});result.innerHTML='<div class="result">'+esc(d.reply||'No recibí un resultado.')+'</div>'}
+    catch(e){result.innerHTML='<div class="result">⚠️ '+esc(e.message||'No pude analizar el archivo.')+'</div>'}
+}
+
+async function livePanel(){
+    try{
+        const d=await fetchJSON('/air-flow/live/token',{method:'POST'});
+        if(!d.token)throw new Error('El servidor no devolvió un token Live válido.');
+        showPanel('<button class="close" id="liveClose" type="button">×</button><h3>🎙️ Air Flow Live</h3><div id="liveStatus" class="result">Conectando…</div><textarea id="liveInput" style="width:100%;min-height:70px;background:#0c1624;color:white;border:1px solid #234;padding:10px;border-radius:10px" placeholder="Escribe un mensaje para la sesión Live..."></textarea><button class="pill" id="liveSend" type="button" disabled>Enviar</button><button class="pill" id="liveStop" type="button">Cerrar conexión</button><div id="liveOutput" class="result" style="min-height:90px"></div>');
+        document.getElementById('liveClose')?.addEventListener('click',stopLive);
+        document.getElementById('liveStop')?.addEventListener('click',stopLive);
+        connectLive(d.token,d.websocket);
+    }catch(e){showError('🎙️ Live',e.message||'Air Flow Live no está disponible ahora.')}
+}
+function stopLive(){if(liveSocket){try{liveSocket.close()}catch(_){}}liveSocket=null;closePanel()}
+function connectLive(token,providedUrl){
+    const status=document.getElementById('liveStatus'),out=document.getElementById('liveOutput'),btn=document.getElementById('liveSend');
+    if(!status||!out||!btn)return;
+    const base=providedUrl||'wss://generativelanguage.googleapis.com/ws/google.ai.generativelanguage.v1beta.GenerativeService.BidiGenerateContentConstrained';
+    const wsUrl=base+(base.includes('?')?'&':'?')+'access_token='+encodeURIComponent(token);
+    try{liveSocket=new WebSocket(wsUrl)}catch(e){status.textContent='⚠️ No se pudo abrir WebSocket: '+(e.message||'error');return}
+    liveSocket.onopen=()=>{status.textContent='🟢 Live conectado';btn.disabled=false;try{liveSocket.send(JSON.stringify({setup:{model:'models/gemini-3.8-live',generationConfig:{responseModalities:['TEXT']},systemInstruction:{parts:[{text:'You are Air Flow, a helpful and concise assistant inside Ocean Hub.'}]}}}))}catch(e){status.textContent='⚠️ No se pudo enviar la configuración.'}};
+    liveSocket.onmessage=event=>{try{const data=JSON.parse(event.data);if(data.setupComplete||data.setup_complete){status.textContent='🟢 Live listo';return}const textParts=[];for(const c of data.serverContent?.modelTurn?.parts||data.server_content?.model_turn?.parts||[]){if(typeof c?.text==='string')textParts.push(c.text)}if(textParts.length){out.textContent+=(out.textContent?'\n':'')+textParts.join('')}}catch(_){}};
+    liveSocket.onerror=()=>{status.textContent='⚠️ Error de conexión Live';btn.disabled=true};
+    liveSocket.onclose=()=>{status.textContent='⚪ Live desconectado';btn.disabled=true};
+    btn.onclick=()=>{const value=document.getElementById('liveInput')?.value?.trim();if(!value||!liveSocket||liveSocket.readyState!==WebSocket.OPEN)return;try{liveSocket.send(JSON.stringify({realtimeInput:{text:value}}));out.textContent+=(out.textContent?'\n':'')+'TÚ: '+value;document.getElementById('liveInput').value=''}catch(e){status.textContent='⚠️ No se pudo enviar el mensaje.'}};
+}
+
+async function createPanel(){
+    showPanel('<button class="close" id="createClose" type="button">×</button><h3>🎨 Air Flow Create</h3><textarea id="cp" style="width:100%;min-height:110px;background:#0c1624;color:white;border:1px solid #234;padding:10px;border-radius:10px" placeholder="Describe la imagen que quieres crear..."></textarea><button class="pill" id="createRunBtn" type="button">Generar</button><div id="cr"></div>');
+    document.getElementById('createClose')?.addEventListener('click',closePanel);document.getElementById('createRunBtn')?.addEventListener('click',createImage);
+}
+async function createImage(){
+    const result=document.getElementById('cr');if(!result)return;
+    const p=document.getElementById('cp')?.value?.trim();if(!p){result.innerHTML='<div class="result">⚠️ Describe la imagen primero.</div>';return}
+    result.innerHTML='<div class="result">Generando imagen…</div>';
+    try{const d=await fetchJSON('/air-flow/create/image',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({prompt:p})});if(!d.data)throw new Error('El servidor no devolvió una imagen.');result.innerHTML='';const img=document.createElement('img');img.style.maxWidth='100%';img.style.borderRadius='14px';img.style.marginTop='12px';img.alt='Imagen generada por Air Flow';img.src='data:'+(d.mimeType||'image/png')+';base64,'+d.data;result.appendChild(img)}
+    catch(e){result.innerHTML='<div class="result">⚠️ '+esc(e.message||'Error al generar la imagen.')+'</div>'}
+}
+
+async function historyPanel(){
+    try{
+        const d=await fetchJSON('/air-flow/conversations');const items=Array.isArray(d.conversations)?d.conversations:[];
+        showPanel('<button class="close" id="historyClose" type="button">×</button><h3>🕘 Historial</h3><div id="historyList"></div>');
+        document.getElementById('historyClose')?.addEventListener('click',closePanel);const list=document.getElementById('historyList');
+        if(!items.length){list.innerHTML='<p>No hay conversaciones guardadas.</p>';return}
+        items.forEach(item=>{const b=document.createElement('button');b.type='button';b.className='drop';b.style.width='100%';b.style.color='inherit';b.style.textAlign='left';b.style.cursor='pointer';b.innerHTML='<b>'+esc(item.title||'Nueva conversación')+'</b><div style="color:#789">'+esc(item.mode||'QUICK')+'</div>';b.addEventListener('click',()=>{conversationHistory=Array.isArray(item.messages)?item.messages.slice(-16):[];msgBox.innerHTML='';conversationHistory.forEach(m=>add(m.role,m.content));closePanel()});list.appendChild(b)});
+    }catch(e){showError('🕘 Historial',e.message||'No se pudo cargar el historial.')}
+}
+
+function selectMode(next){mode=String(next||'QUICK').toUpperCase();document.querySelectorAll('[data-mode]').forEach(x=>x.classList.toggle('active',x.dataset.mode===mode));input.placeholder='Pregunta lo que quieras… · '+mode}
+function chooseFile(purpose){filePurpose=purpose;file.value='';file.removeAttribute('capture');file.accept=purpose==='vision'?'image/*':'image/*,.pdf,.txt,.md,.csv,.json,.js,.ts,.html,.css,.py,.lua,.xml,.yaml,.yml,.log';if(purpose==='camera'){filePurpose='vision';file.accept='image/*';file.setAttribute('capture','environment')}file.click()}
+
+for(const b of document.querySelectorAll('[data-mode]'))b.addEventListener('click',()=>selectMode(b.dataset.mode));
+for(const b of document.querySelectorAll('[data-action]'))b.addEventListener('click',()=>{const a=b.dataset.action;if(a==='memory')return memoryPanel();if(a==='live')return livePanel();if(a==='create')return createPanel();if(a==='vision')return chooseFile('vision');if(a==='files')return chooseFile('files')});
+document.getElementById('new')?.addEventListener('click',()=>{conversationHistory=[];msgBox.innerHTML='<div id="empty" class="msg ai">Nueva conversación. ✈️</div>';input.focus()});
+document.getElementById('history')?.addEventListener('click',historyPanel);
+document.getElementById('attach')?.addEventListener('click',()=>chooseFile('files'));
+document.getElementById('cam')?.addEventListener('click',()=>chooseFile('camera'));
+file.addEventListener('change',()=>{const f=file.files?.[0];if(!f)return;const purpose=filePurpose;file.value='';if(purpose==='vision')vision(f);else filesPanel(f)});
+send.addEventListener('click',sendMsg);
+input.addEventListener('keydown',e=>{if(e.key==='Enter'&&!e.shiftKey){e.preventDefault();sendMsg()}});
+input.focus();
+</script>
 </script></body></html>`, { headers: { 'Content-Type': 'text/html; charset=utf-8' } });
 }
 
