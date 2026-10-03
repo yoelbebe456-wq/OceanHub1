@@ -1,6 +1,8 @@
 {
   "name": "oceanhud",
   "private": true,
+  "private": true,
+"description": "Ocean Hub"
   "devDependencies": {
     "wrangler": "^4.146.0"
   }
