@@ -4563,35 +4563,58 @@ async function handleSell(env, request) {
     </div>
     <script>
         function copiarClave(clave) {
-            navigator.clipboard.writeText(clave).then(() => alert('Clave copiada al portapapeles'));
+            if (navigator.clipboard && navigator.clipboard.writeText) {
+                navigator.clipboard.writeText(clave)
+                    .then(() => alert('Clave copiada al portapapeles'))
+                    .catch(() => prompt('Copia esta clave:', clave));
+            } else {
+                prompt('Copia esta clave:', clave);
+            }
         }
         function comprarPack(packId) {
-            if (confirm('¿Comprar este pack por $' + ${JSON.stringify(PACKS)}[packId].price + '?')) {
+            const pack = ${JSON.stringify(PACKS)}[packId];
+            if (!pack) {
+                alert('❌ Pack no válido.');
+                return;
+            }
+            if (confirm('¿Comprar este pack por $' + pack.price + '?')) {
                 fetch('/comprar-pack', {
                     method: 'POST',
                     headers: { 'Content-Type': 'application/json' },
                     body: JSON.stringify({ pack: packId })
                 })
-                .then(res => res.json())
+                .then(async res => {
+                    const data = await res.json().catch(() => ({}));
+                    if (!res.ok) throw new Error(data.error || 'No se pudo comprar el pack.');
+                    return data;
+                })
                 .then(data => {
                     alert(data.message || 'Pack comprado');
                     location.reload();
                 })
-                .catch(err => alert('Error: ' + err));
+                .catch(err => alert('Error: ' + err.message));
             }
         }
         function solicitarRetiro() {
             const monto = prompt('¿Cuánto deseas retirar? (máximo $' + ${reseller.saldo.toFixed(2)} + ')');
-            if (monto) {
-                fetch('/solicitar-retiro', {
-                    method: 'POST',
-                    headers: { 'Content-Type': 'application/json' },
-                    body: JSON.stringify({ monto: parseFloat(monto) })
-                })
-                .then(res => res.json())
-                .then(data => alert(data.message))
-                .catch(err => alert('Error: '+err));
+            if (!monto) return;
+            const parsedMonto = Number.parseFloat(monto);
+            if (!Number.isFinite(parsedMonto) || parsedMonto <= 0) {
+                alert('❌ Introduce un monto válido.');
+                return;
             }
+            fetch('/solicitar-retiro', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ monto: parsedMonto })
+            })
+            .then(async res => {
+                const data = await res.json().catch(() => ({}));
+                if (!res.ok) throw new Error(data.error || 'No se pudo registrar el retiro.');
+                return data;
+            })
+            .then(data => alert(data.message || 'Solicitud registrada.'))
+            .catch(err => alert('Error: ' + err.message));
         }
         const ctx = document.getElementById('salesChart').getContext('2d');
         new Chart(ctx, {
@@ -4792,33 +4815,37 @@ async function handleShop(env, request) {
         <a href="/home" class="back">← Volver al inicio</a>
     </div>
     <script>
-        function comprar(priceId) {
-            const coupon = document.getElementById('couponInput') ? document.getElementById('couponInput').value : null;
-            let url = '/shop/create-checkout?price_id=' + priceId;
-            if (coupon) url += '&coupon=' + encodeURIComponent(coupon);
-            fetch(url)
-            .then(res => res.json())
-            .then(data => {
+        async function comprar(priceId) {
+            try {
+                const coupon = document.getElementById('couponInput') ? document.getElementById('couponInput').value.trim() : '';
+                let url = '/shop/create-checkout?price_id=' + encodeURIComponent(priceId);
+                if (coupon) url += '&coupon=' + encodeURIComponent(coupon);
+                const res = await fetch(url, { credentials: 'same-origin' });
+                const data = await res.json().catch(() => ({}));
+                if (!res.ok) throw new Error(data.error || 'No se pudo crear la orden.');
                 if (data.links && data.links.length) {
                     const approveLink = data.links.find(link => link.rel === 'approve');
-                    if (approveLink) {
+                    if (approveLink && approveLink.href) {
                         window.location.href = approveLink.href;
                     } else {
-                        alert('Error: no se encontró enlace de aprobación.');
+                        throw new Error('No se encontró enlace de aprobación.');
                     }
-                } else if (data.error) {
-                    alert('Error: ' + data.error);
                 } else {
-                    alert('Error inesperado al crear la orden.');
+                    throw new Error(data.error || 'Error inesperado al crear la orden.');
                 }
-            })
-            .catch(err => alert('Error: '+err));
+            } catch (err) {
+                alert('Error: ' + err.message);
+            }
         }
         function aplicarCupon() {
-            const coupon = document.getElementById('couponInput').value.trim();
-            if (coupon) {
-                window.location.href = '/shop?coupon=' + encodeURIComponent(coupon);
+            const input = document.getElementById('couponInput');
+            const coupon = input ? input.value.trim() : '';
+            if (!coupon) {
+                alert('Introduce un código de cupón.');
+                if (input) input.focus();
+                return;
             }
+            window.location.href = '/shop?coupon=' + encodeURIComponent(coupon);
         }
     </script>
     ${getCookieBannerScript()}
@@ -4911,18 +4938,24 @@ async function handleKey() {
     <script>
         async function verificar() {
             const key = document.getElementById('keyInput').value.trim();
+            const resultDiv = document.getElementById('result');
             if (!key) { alert('Ingresa una clave'); return; }
             try {
-                const res = await fetch('/verify-web?key=' + encodeURIComponent(key));
-                const data = await res.json();
-                const resultDiv = document.getElementById('result');
-                if (data.success && data.valid) {
-                    resultDiv.innerHTML = '<p style="color:#00cc88;">✅ Clave válida</p><p>' + (data.message || '') + '</p>';
-                } else {
-                    resultDiv.innerHTML = '<p style="color:#ff6666;">❌ Clave inválida</p><p>' + (data.error || data.message || '') + '</p>';
-                }
+                const res = await fetch('/verify-web?key=' + encodeURIComponent(key), {
+                    credentials: 'same-origin'
+                });
+                const data = await res.json().catch(() => ({}));
+                if (!res.ok) throw new Error(data.error || 'No se pudo verificar la clave.');
+                resultDiv.textContent = '';
+                const title = document.createElement('p');
+                title.style.color = (data.success && data.valid) ? '#00cc88' : '#ff6666';
+                title.textContent = (data.success && data.valid) ? '✅ Clave válida' : '❌ Clave inválida';
+                const detail = document.createElement('p');
+                detail.textContent = data.message || data.error || '';
+                resultDiv.append(title, detail);
             } catch (e) {
-                document.getElementById('result').innerHTML = '<p style="color:#ff6666;">Error al verificar: ' + e.message + '</p>';
+                resultDiv.textContent = 'Error al verificar: ' + e.message;
+                resultDiv.style.color = '#ff6666';
             }
         }
     </script>
@@ -5179,7 +5212,7 @@ async function handleMainRoute(env) {
                     <span class="key-uses">Usos: ${used}${maxUses !== Infinity ? `/${maxUses}` : ''}</span>
                     ${k.tags.length > 0 ? `<span class="key-tags">🏷️ ${k.tags.join(', ')}</span>` : ''}
                 </div>
-                <button class="btn-info" onclick="showKeyInfo('${k.key}')">📋 Info</button>
+                <button class="btn-info" onclick="showKeyInfo(${escapeJSAttribute(k.key)})">📋 Info</button>
             </div>
         `;
     });
@@ -5330,42 +5363,52 @@ async function handleMainRoute(env) {
             });
         }
 
-        function showKeyInfo(key) {
-            fetch('/key-info?key=' + encodeURIComponent(key))
-                .then(res => res.json())
-                .then(data => {
-                    const modal = document.getElementById('infoModal');
-                    document.getElementById('modalTitle').textContent = '🔑 ' + key;
-                    let html = '';
-                    html += '<div class="detail-row"><span>Rango</span><span>' + data.rango + '</span></div>';
-                    html += '<div class="detail-row"><span>Tipo</span><span>' + data.type + '</span></div>';
-                    html += '<div class="detail-row"><span>Expiración</span><span>' + data.expires + '</span></div>';
-                    html += '<div class="detail-row"><span>Usos</span><span>' + data.uses + (data.maxUses ? '/' + data.maxUses : '') + '</span></div>';
-                    html += '<div class="detail-row"><span>Estado</span><span>' + (data.blocked ? '🚫 Bloqueada' : '✅ Activa') + '</span></div>';
-                    html += '<div class="detail-row"><span>Dinámica</span><span>' + (data.dynamic ? '🎲 Sí' : '📌 No') + '</span></div>';
-                    html += '<div class="detail-row"><span>Un solo uso</span><span>' + (data.un_solo_uso ? '✅ Sí' : '❌ No') + '</span></div>';
-                    if (data.tags && data.tags.length) {
-                        html += '<div class="detail-row"><span>Tags</span><span>' + data.tags.join(', ') + '</span></div>';
-                    }
-                    if (data.notas) {
-                        html += '<div class="detail-row"><span>Notas</span><span>' + escapeHTML(data.notas) + '</span></div>';
-                    }
-                    html += '<h3 style="margin-top:20px;">Historial (últimas 10)</h3>';
-                    if (data.history && data.history.length) {
-                        data.history.forEach(h => {
-                            const cls = h.valid ? 'valid' : 'invalid';
-                            html += '<div class="history-item ' + cls + '">';
-                            html += '<span>' + (h.valid ? '✅' : '❌') + ' ' + new Date(h.timestamp).toLocaleString() + '</span>';
-                            html += '<span>' + h.ip + '</span>';
-                            html += '</div>';
-                        });
-                    } else {
-                        html += '<p>Sin verificaciones aún.</p>';
-                    }
-                    document.getElementById('modalContent').innerHTML = html;
-                    modal.classList.add('active');
-                })
-                .catch(err => { alert('Error al cargar información'); });
+        function escapeInfoText(value) {
+            const div = document.createElement('div');
+            div.textContent = String(value ?? '');
+            return div.innerHTML;
+        }
+
+        async function showKeyInfo(key) {
+            try {
+                const res = await fetch('/key-info?key=' + encodeURIComponent(key), {
+                    credentials: 'same-origin'
+                });
+                const data = await res.json().catch(() => ({}));
+                if (!res.ok) throw new Error(data.error || 'No se pudo cargar la información.');
+                const modal = document.getElementById('infoModal');
+                document.getElementById('modalTitle').textContent = '🔑 ' + key;
+                let html = '';
+                html += '<div class="detail-row"><span>Rango</span><span>' + escapeInfoText(data.rango) + '</span></div>';
+                html += '<div class="detail-row"><span>Tipo</span><span>' + escapeInfoText(data.type) + '</span></div>';
+                html += '<div class="detail-row"><span>Expiración</span><span>' + escapeInfoText(data.expires) + '</span></div>';
+                html += '<div class="detail-row"><span>Usos</span><span>' + escapeInfoText(data.uses) + (data.maxUses ? '/' + escapeInfoText(data.maxUses) : '') + '</span></div>';
+                html += '<div class="detail-row"><span>Estado</span><span>' + (data.blocked ? '🚫 Bloqueada' : '✅ Activa') + '</span></div>';
+                html += '<div class="detail-row"><span>Dinámica</span><span>' + (data.dynamic ? '🎲 Sí' : '📌 No') + '</span></div>';
+                html += '<div class="detail-row"><span>Un solo uso</span><span>' + (data.un_solo_uso ? '✅ Sí' : '❌ No') + '</span></div>';
+                if (Array.isArray(data.tags) && data.tags.length) {
+                    html += '<div class="detail-row"><span>Tags</span><span>' + data.tags.map(escapeInfoText).join(', ') + '</span></div>';
+                }
+                if (data.notas) {
+                    html += '<div class="detail-row"><span>Notas</span><span>' + escapeInfoText(data.notas) + '</span></div>';
+                }
+                html += '<h3 style="margin-top:20px;">Historial (últimas 10)</h3>';
+                if (Array.isArray(data.history) && data.history.length) {
+                    data.history.forEach(h => {
+                        const cls = h.valid ? 'valid' : 'invalid';
+                        html += '<div class="history-item ' + cls + '">';
+                        html += '<span>' + (h.valid ? '✅' : '❌') + ' ' + escapeInfoText(new Date(h.timestamp).toLocaleString()) + '</span>';
+                        html += '<span>' + escapeInfoText(h.ip) + '</span>';
+                        html += '</div>';
+                    });
+                } else {
+                    html += '<p>Sin verificaciones aún.</p>';
+                }
+                document.getElementById('modalContent').innerHTML = html;
+                modal.classList.add('active');
+            } catch (err) {
+                alert('Error al cargar información: ' + err.message);
+            }
         }
 
         function closeModal() {
@@ -5440,7 +5483,7 @@ async function handleAdminRoute(env, url, headers, request) {
             const used = k.uses || 0;
             const maxUses = k.maxUses || '∞';
             const statusBadge = isBlocked ? '<span style="color:#ff6666;">🚫 Bloqueada</span>' : '<span style="color:#00cc88;">✅ Activa</span>';
-            const deleteBtn = isDynamic ? `<button onclick="action('delete','${k.key}')" class="btn-sm" style="background:#cc0000;">Eliminar</button>` : '';
+            const deleteBtn = isDynamic ? `<button onclick="action('delete',${escapeJSAttribute(k.key)})" class="btn-sm" style="background:#cc0000;">Eliminar</button>` : '';
             const tags = k.tags && k.tags.length ? k.tags.join(', ') : '';
             tableRows += `
                 <tr>
@@ -5453,12 +5496,12 @@ async function handleAdminRoute(env, url, headers, request) {
                     <td>${isDynamic ? '🎲 Sí' : '📌 No'}</td>
                     <td style="font-size:0.8rem;">${k.un_solo_uso ? '🔒 1 uso' : ''} ${tags}</td>
                     <td style="display:flex;flex-wrap:wrap;gap:4px;">
-                        <button onclick="action('block','${k.key}')" class="btn-sm" style="background:#ff4444;">Bloquear</button>
-                        <button onclick="action('unblock','${k.key}')" class="btn-sm" style="background:#ff8800;">Desbloquear</button>
-                        <button onclick="action('reset','${k.key}')" class="btn-sm" style="background:#ffaa00;">Reiniciar</button>
+                        <button onclick="action('block',${escapeJSAttribute(k.key)})" class="btn-sm" style="background:#ff4444;">Bloquear</button>
+                        <button onclick="action('unblock',${escapeJSAttribute(k.key)})" class="btn-sm" style="background:#ff8800;">Desbloquear</button>
+                        <button onclick="action('reset',${escapeJSAttribute(k.key)})" class="btn-sm" style="background:#ffaa00;">Reiniciar</button>
                         ${deleteBtn}
-                        <button onclick="action('unbind','${k.key}')" class="btn-sm" style="background:#8888ff;">Desvincular</button>
-                        ${isDynamic ? `<button onclick="action('renew','${k.key}')" class="btn-sm" style="background:#00cc88;">Renovar +30d</button>` : ''}
+                        <button onclick="action('unbind',${escapeJSAttribute(k.key)})" class="btn-sm" style="background:#8888ff;">Desvincular</button>
+                        ${isDynamic ? `<button onclick="action('renew',${escapeJSAttribute(k.key)})" class="btn-sm" style="background:#00cc88;">Renovar +30d</button>` : ''}
                     </td>
                 </tr>
             `;
@@ -6034,467 +6077,6 @@ async function handleAdminRoute(env, url, headers, request) {
 
     return new Response('⛔ No autorizado', { status: 403 });
 
-    const stats = await getStats(env) || {};
-    const dynamicKeys = await getDynamicKeys(env) || {};
-    let allKeys = [];
-    for (let k of STATIC_KEYS) {
-        const usage = stats.keys_usage?.[k.hash] || { count: 0, blocked: false };
-        allKeys.push({ key: k.key, rango: k.rango, type: k.type, expires: k.expires, maxUses: k.maxUses || '∞', uses: usage.count, blocked: usage.blocked, dynamic: false, tags: [], notas: '', un_solo_uso: false });
-    }
-    for (let hash in dynamicKeys) {
-        const k = dynamicKeys[hash];
-        const usage = stats.keys_usage?.[hash] || { count: 0, blocked: false };
-        allKeys.push({ key: k.key, rango: k.rango, type: k.type, expires: k.expires, maxUses: k.maxUses || '∞', uses: usage.count, blocked: usage.blocked, dynamic: true, tags: k.tags || [], notas: k.notas || '', un_solo_uso: k.un_solo_uso || false });
-    }
-
-    const hourlyLabels = [];
-    const hourlyData = [];
-    if (stats.hourly_usage) {
-        const hours = Object.keys(stats.hourly_usage).sort();
-        hours.slice(-24).forEach(h => {
-            hourlyLabels.push(h.replace('T', ' '));
-            hourlyData.push(stats.hourly_usage[h]);
-        });
-    }
-
-    const dailyLabels = [];
-    const dailyValid = [];
-    const dailyInvalid = [];
-    if (stats.daily_usage) {
-        const days = Object.keys(stats.daily_usage).sort().slice(-7);
-        days.forEach(d => {
-            dailyLabels.push(d);
-            dailyValid.push(stats.daily_usage[d].valid || 0);
-            dailyInvalid.push(stats.daily_usage[d].invalid || 0);
-        });
-    }
-
-    const ingresosResp = await handleAdminIngresos(env, new URL('/admin/ingresos', 'http://dummy'));
-    const ingresosData = await ingresosResp.json();
-
-    let tableRows = '';
-    allKeys.forEach(k => {
-        const isBlocked = k.blocked || false;
-        const isDynamic = k.dynamic || false;
-        const used = k.uses || 0;
-        const maxUses = k.maxUses || '∞';
-        const statusBadge = isBlocked ? '<span style="color:#ff6666;">🚫 Bloqueada</span>' : '<span style="color:#00cc88;">✅ Activa</span>';
-        const deleteBtn = isDynamic ? `<button onclick="action('delete','${k.key}')" class="btn-sm" style="background:#cc0000;">Eliminar</button>` : '';
-        const tags = k.tags && k.tags.length ? k.tags.join(', ') : '';
-        tableRows += `
-            <tr>
-                <td><strong>${escapeHTML(k.key)}</strong></td>
-                <td>${escapeHTML(k.rango)}</td>
-                <td><span style="background:rgba(0,200,255,0.2);padding:2px 10px;border-radius:20px;">${k.type}</span></td>
-                <td>${escapeHTML(k.expires)}</td>
-                <td>${used}${maxUses !== '∞' ? '/'+maxUses : ''}</td>
-                <td>${statusBadge}</td>
-                <td>${isDynamic ? '🎲 Sí' : '📌 No'}</td>
-                <td style="font-size:0.8rem;">${k.un_solo_uso ? '🔒 1 uso' : ''} ${tags}</td>
-                <td style="display:flex;flex-wrap:wrap;gap:4px;">
-                    <button onclick="action('block','${k.key}')" class="btn-sm" style="background:#ff4444;">Bloquear</button>
-                    <button onclick="action('unblock','${k.key}')" class="btn-sm" style="background:#ff8800;">Desbloquear</button>
-                    <button onclick="action('reset','${k.key}')" class="btn-sm" style="background:#ffaa00;">Reiniciar</button>
-                    ${deleteBtn}
-                    <button onclick="action('unbind','${k.key}')" class="btn-sm" style="background:#8888ff;">Desvincular</button>
-                    ${isDynamic ? `<button onclick="action('renew','${k.key}')" class="btn-sm" style="background:#00cc88;">Renovar +30d</button>` : ''}
-                </td>
-            </tr>
-        `;
-    });
-
-    const html = `<!DOCTYPE html>
-    <html>
-    <head>
-        <meta charset="UTF-8">
-        <title>🌊 Ocean Hub - Admin</title>
-        <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
-        <style>
-            * { margin:0; padding:0; box-sizing:border-box; }
-            body { background: #0a1a2b; color: #e0f0ff; font-family: 'Segoe UI', sans-serif; padding:20px; }
-            .container { max-width:1400px; margin:0 auto; }
-            h1 { color: #00ccff; margin-bottom:20px; display:flex; align-items:center; gap:15px; }
-            h1 small { font-size:0.9rem; color:#88bbdd; font-weight:normal; }
-            .hud-actions {
-                background: rgba(0, 20, 40, 0.7); border: 3px solid #00ccff; border-radius: 20px;
-                padding: 20px 25px; margin: 20px 0 30px 0; display: flex; flex-wrap: wrap;
-                align-items: center; gap: 15px; backdrop-filter: blur(6px);
-                box-shadow: 0 0 40px rgba(0,200,255,0.15), inset 0 0 30px rgba(0,200,255,0.05);
-                position: relative;
-            }
-            .hud-actions::before {
-                content: "⚡ PANEL DE CONTROL"; position: absolute; top: -12px; left: 20px;
-                background: #0a1a2b; padding: 0 15px; font-size: 0.8rem; font-weight: bold;
-                color: #88ddff; letter-spacing: 2px; border-radius: 30px;
-                border: 1px solid #00ccff; backdrop-filter: blur(4px);
-            }
-            .hud-actions button, .hud-actions a {
-                padding: 10px 22px; border: none; border-radius: 40px;
-                background: rgba(0,200,255,0.15); color: white; cursor: pointer;
-                transition: all 0.25s; text-decoration: none; font-size: 0.95rem;
-                font-weight: 500; border: 1px solid transparent;
-            }
-            .hud-actions button:hover, .hud-actions a:hover {
-                background: #00ccff; color: #0a1a2b; transform: scale(1.02);
-                box-shadow: 0 0 25px rgba(0,200,255,0.4);
-            }
-            .hud-actions a { background: rgba(0,200,255,0.1); border-color: rgba(0,200,255,0.2); }
-            .hud-actions a:hover { background: #00ccff; border-color: #00ccff; }
-            .stats-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(150px,1fr)); gap:15px; margin-bottom:25px; }
-            .stat-box { background:rgba(255,255,255,0.05); border-radius:15px; padding:15px 20px; text-align:center; transition:0.3s; }
-            .stat-box:hover { background:rgba(255,255,255,0.1); }
-            .stat-box .num { font-size:2rem; font-weight:bold; color:#00ccff; }
-            .stat-box .label { font-size:0.85rem; opacity:0.7; }
-            .stat-box .num.valid { color:#00cc88; }
-            .stat-box .num.invalid { color:#ff6666; }
-            .table-wrapper { overflow-x:auto; margin-top:20px; border-radius:15px; background:rgba(255,255,255,0.03); padding:5px; }
-            table { width:100%; border-collapse:collapse; font-size:0.9rem; }
-            th, td { padding:12px 10px; text-align:left; border-bottom:1px solid rgba(255,255,255,0.06); }
-            th { background:rgba(0,0,0,0.3); color:#88ccff; font-weight:600; position:sticky; top:0; z-index:10; }
-            td { vertical-align:middle; }
-            td button.btn-sm { padding:4px 12px; border:none; border-radius:20px; color:white; cursor:pointer; transition:0.2s; font-size:0.8rem; }
-            td button.btn-sm:hover { opacity:0.8; transform:scale(0.96); }
-            .chart-container { display:flex; flex-wrap:wrap; gap:20px; margin-top:30px; }
-            .chart-box { background:rgba(255,255,255,0.04); border-radius:20px; padding:20px; flex:1; min-width:280px; }
-            .modal { display:none; position:fixed; top:0; left:0; width:100%; height:100%; background:rgba(0,0,0,0.7); backdrop-filter:blur(5px); z-index:1000; justify-content:center; align-items:center; }
-            .modal.active { display:flex; }
-            .modal-content { background:#1b3a5c; border-radius:30px; padding:30px; max-width:500px; width:90%; max-height:80vh; overflow-y:auto; box-shadow:0 20px 60px rgba(0,0,0,0.8); animation:fadeIn 0.3s ease; }
-            .modal-content h2 { color:#00ccff; margin-bottom:15px; }
-            .modal-content input, .modal-content select, .modal-content textarea { width:100%; padding:12px; margin:8px 0; border-radius:12px; border:none; background:rgba(255,255,255,0.08); color:white; font-size:1rem; }
-            .modal-content input::placeholder, .modal-content textarea::placeholder { color:#aac; }
-            .modal-content select option { background:#1b3a5c; }
-            .modal-content button { padding:10px 25px; border:none; border-radius:30px; background:#00ccff; color:#0a1a2b; cursor:pointer; font-weight:bold; transition:0.3s; margin-top:10px; }
-            .modal-content button:hover { background:#33ddff; }
-            .modal-content .close { float:right; background:none; border:none; color:white; font-size:2rem; cursor:pointer; }
-            .modal-content .close:hover { color:#ff6666; }
-            .batch-keys { background:rgba(0,0,0,0.3); border-radius:12px; padding:15px; margin:10px 0; font-family: monospace; font-size:0.9rem; word-break:break-all; }
-            .batch-keys span { display:block; padding:4px 0; border-bottom:1px solid rgba(255,255,255,0.05); }
-            @keyframes fadeIn { from { opacity:0; transform:scale(0.95); } to { opacity:1; transform:scale(1); } }
-            @media (max-width:600px) {
-                table { font-size:0.75rem; }
-                td button.btn-sm { font-size:0.7rem; padding:2px 8px; }
-                .stats-grid { grid-template-columns:1fr 1fr; }
-                .hud-actions { flex-direction: column; align-items: stretch; }
-            }
-            .ingresos-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(120px,1fr)); gap:10px; margin:15px 0; }
-            .ingreso-item { background:rgba(0,200,255,0.08); border-radius:12px; padding:10px; text-align:center; }
-            .ingreso-item .valor { font-size:1.5rem; color:#ffcc00; }
-            .ingreso-item .etiqueta { font-size:0.8rem; opacity:0.7; }
-        </style>
-    </head>
-    <body>
-    <div class="container">
-        <h1>🔐 Panel de Administración <small>Ocean Hub</small></h1>
-
-        <div class="stats-grid">
-            <div class="stat-box"><div class="num">${stats.total_verifications || 0}</div><div class="label">Total</div></div>
-            <div class="stat-box"><div class="num valid">${stats.valid_verifications || 0}</div><div class="label">Válidas</div></div>
-            <div class="stat-box"><div class="num invalid">${stats.invalid_verifications || 0}</div><div class="label">Inválidas</div></div>
-            <div class="stat-box"><div class="num">${STATIC_KEYS.length}</div><div class="label">Estáticas</div></div>
-            <div class="stat-box"><div class="num">${Object.keys(dynamicKeys).length}</div><div class="label">Dinámicas</div></div>
-            <div class="stat-box"><div class="num">${Object.values(stats.keys_usage || {}).filter(u => u.count > 0).length}</div><div class="label">Usadas</div></div>
-            <div class="stat-box"><div class="num">${stats.sales?.total || 0}</div><div class="label">Ventas</div></div>
-            <div class="stat-box"><div class="num">$${(stats.sales?.revenue || 0).toFixed(2)}</div><div class="label">Ingresos totales</div></div>
-        </div>
-
-        <div class="ingresos-grid">
-            <div class="ingreso-item"><div class="valor">$${ingresosData.dia?.toFixed(2) || '0.00'}</div><div class="etiqueta">Hoy</div></div>
-            <div class="ingreso-item"><div class="valor">$${ingresosData.semana?.toFixed(2) || '0.00'}</div><div class="etiqueta">Última semana</div></div>
-            <div class="ingreso-item"><div class="valor">$${ingresosData.mes?.toFixed(2) || '0.00'}</div><div class="etiqueta">Último mes</div></div>
-            <div class="ingreso-item"><div class="valor">${ingresosData.producto_mas_vendido || 'Ninguno'}</div><div class="etiqueta">Producto más vendido</div></div>
-        </div>
-
-        <div class="hud-actions">
-            <button onclick="openGenerateModal()">➕ Generar clave</button>
-            <button onclick="openBatchModal()">🎲 Lote (5)</button>
-            <button onclick="openPruebaModal()">🧪 Generar prueba</button>
-            <button onclick="openResellerModal()">👥 Hacer revendedor</button>
-            <a href="/export-csv">📥 Exportar CSV</a>
-            <a href="/export-json">📥 Exportar JSON</a>
-            <a href="/admin/compras" style="background:rgba(255,200,0,0.2);">📊 Ver compras</a>
-            <a href="/admin/logs" style="background:rgba(0,200,255,0.2);">📋 Logs</a>
-            <a href="/admin/resellers" style="background:rgba(255,200,0,0.2);">👥 Revendedores</a>
-            <a href="/admin/users" style="background:rgba(0,200,255,0.2);">👤 Usuarios</a>
-            <button onclick="doBackup()" style="background:rgba(255,100,0,0.3);">💾 Backup</button>
-            <button onclick="openUploadModal()" style="background:rgba(0,200,100,0.3);">📤 Subir CSV</button>
-            <button onclick="location.reload()">🔄 Refrescar</button>
-            <a href="/profile" style="background:rgba(0,200,255,0.2);">👤 Mi perfil</a>
-        </div>
-
-        <div class="table-wrapper">
-            <table>
-                <thead><tr><th>Clave</th><th>Rango</th><th>Tipo</th><th>Duración</th><th>Usos</th><th>Estado</th><th>Dinámica</th><th>Tags/Notas</th><th>Acciones</th></tr></thead>
-                <tbody>${tableRows}</tbody>
-            </table>
-        </div>
-
-        <div class="chart-container">
-            <div class="chart-box"><canvas id="hourlyChart"></canvas></div>
-            <div class="chart-box"><canvas id="dailyChart"></canvas></div>
-        </div>
-    </div>
-
-    <!-- Modales -->
-    <div class="modal" id="genModal">
-        <div class="modal-content">
-            <button class="close" onclick="closeModal('genModal')">&times;</button>
-            <h2>🔑 Generar clave</h2>
-            <input type="text" id="genKey" placeholder="Clave (dejar vacío para aleatoria)">
-            <input type="text" id="genRango" placeholder="Rango personalizado (ej: 🌟 VIP Especial)" value="🦈 Tiburón">
-            <select id="genType">
-                <option value="gratuita">Gratuita</option>
-                <option value="premium" selected>Premium</option>
-                <option value="vip">VIP</option>
-                <option value="staff">Staff</option>
-                <option value="prueba">Prueba</option>
-            </select>
-            <input type="text" id="genExpires" placeholder="Duración (ej: 30 días, 1 año, permanente)" value="30 días">
-            <input type="number" id="genMaxUses" placeholder="Límite de usos (infinito si vacío)">
-            <input type="text" id="genTags" placeholder="Tags separados por coma (ej: evento, vip)">
-            <textarea id="genNotas" placeholder="Notas internas" rows="2"></textarea>
-            <label style="display:flex;align-items:center;gap:10px;margin:8px 0;">
-                <input type="checkbox" id="genUnSoloUso"> Un solo uso
-            </label>
-            <input type="password" id="genPin" placeholder="PIN de seguridad">
-            <button onclick="generateKey()">Generar</button>
-            <div id="genResult" style="margin-top:12px;color:#88ddff;"></div>
-        </div>
-    </div>
-
-    <div class="modal" id="batchModal">
-        <div class="modal-content">
-            <button class="close" onclick="closeModal('batchModal')">&times;</button>
-            <h2>🎲 Lote de claves</h2>
-            <p>Se generarán <strong>5 claves</strong> con tipo <em>premium</em>, rango <em>🦈 Tiburón</em> y duración <em>30 días</em>.</p>
-            <input type="password" id="batchPin" placeholder="PIN de seguridad">
-            <button onclick="generateBatch()">Generar lote</button>
-            <div id="batchResult" style="margin-top:15px;"></div>
-        </div>
-    </div>
-
-    <div class="modal" id="pruebaModal">
-        <div class="modal-content">
-            <button class="close" onclick="closeModal('pruebaModal')">&times;</button>
-            <h2>🧪 Generar clave de prueba</h2>
-            <p>Clave temporal de un solo uso.</p>
-            <select id="pruebaHoras">
-                <option value="1">1 hora</option>
-                <option value="3">3 horas</option>
-                <option value="6">6 horas</option>
-            </select>
-            <input type="password" id="pruebaPin" placeholder="PIN de seguridad">
-            <button onclick="generarPrueba()">Generar</button>
-            <div id="pruebaResult" style="margin-top:12px;"></div>
-        </div>
-    </div>
-
-    <div class="modal" id="resellerModal">
-        <div class="modal-content">
-            <button class="close" onclick="closeModal('resellerModal')">&times;</button>
-            <h2>👥 Hacer revendedor</h2>
-            <p>Convierte un usuario existente en revendedor.</p>
-            <input type="email" id="resellerEmail" placeholder="Email del usuario" style="width:100%;padding:10px;border-radius:10px;border:none;margin:8px 0;">
-            <input type="number" id="resellerPorcentaje" placeholder="% de comisión (ej: 25)" value="25" style="width:100%;padding:10px;border-radius:10px;border:none;margin:8px 0;">
-            <input type="password" id="resellerPin" placeholder="PIN de seguridad" style="width:100%;padding:10px;border-radius:10px;border:none;margin:8px 0;">
-            <button onclick="hacerReseller()">Convertir</button>
-            <div id="resellerResult" style="margin-top:12px;"></div>
-        </div>
-    </div>
-
-    <div class="modal" id="uploadModal">
-        <div class="modal-content">
-            <button class="close" onclick="closeModal('uploadModal')">&times;</button>
-            <h2>📤 Subir archivo CSV</h2>
-            <p>Sube un CSV con una lista de claves (una por línea).</p>
-            <form id="uploadForm" enctype="multipart/form-data">
-                <input type="file" name="file" accept=".csv,.txt" style="background:transparent;border:1px solid #00ccff;padding:10px;border-radius:10px;">
-                <input type="password" id="uploadPin" placeholder="PIN de seguridad" style="width:100%;padding:10px;border-radius:10px;border:none;margin:8px 0;">
-                <button type="button" onclick="uploadKeys()">Subir</button>
-            </form>
-            <div id="uploadResult" style="margin-top:12px;"></div>
-        </div>
-    </div>
-
-    <script>
-        
-        
-
-        function action(type, key) {
-            const pin = prompt('Introduce el PIN de seguridad:');
-            
-            let url = '/admin-action?action='+type+'&key='+encodeURIComponent(key)+'&pin='+encodeURIComponent(pin);
-            if (type === 'renew') {
-                const days = prompt('¿Cuántos días renovar? (30 por defecto)', '30');
-                if (!days) return;
-                url += '&days='+parseInt(days);
-            }
-            fetch(url)
-            .then(res => res.json())
-            .then(data => {
-                alert(data.message || data.error);
-                location.reload();
-            })
-            .catch(err => alert('Error: ' + err));
-        }
-
-        function openGenerateModal() { document.getElementById('genModal').classList.add('active'); }
-        function openBatchModal() { document.getElementById('batchModal').classList.add('active'); }
-        function openPruebaModal() { document.getElementById('pruebaModal').classList.add('active'); }
-        function openResellerModal() { document.getElementById('resellerModal').classList.add('active'); }
-        function openUploadModal() { document.getElementById('uploadModal').classList.add('active'); }
-        function closeModal(id) { document.getElementById(id).classList.remove('active'); }
-
-        function generateKey() {
-            const key = document.getElementById('genKey').value.trim() || undefined;
-            const rango = document.getElementById('genRango').value.trim() || '🦈 Tiburón';
-            const type = document.getElementById('genType').value;
-            const expires = document.getElementById('genExpires').value.trim() || '30 días';
-            const maxUses = document.getElementById('genMaxUses').value;
-            const tags = document.getElementById('genTags').value.trim();
-            const notas = document.getElementById('genNotas').value.trim();
-            const un_solo_uso = document.getElementById('genUnSoloUso').checked;
-            const pin = document.getElementById('genPin').value;
-            
-            const payload = { key, rango, type, expires, maxUses: maxUses ? parseInt(maxUses) : undefined, tags, notas, un_solo_uso, pin };
-            fetch('/generate', {
-                method: 'POST',
-                headers: { 'Content-Type': 'application/json' },
-                body: JSON.stringify(payload)
-            })
-            .then(res => res.json())
-            .then(data => {
-                if (data.error) {
-                    document.getElementById('genResult').innerHTML = '❌ ' + data.error;
-                } else {
-                    document.getElementById('genResult').innerHTML = '✅ ' + data.message;
-                    setTimeout(() => location.reload(), 1500);
-                }
-            })
-            .catch(err => alert('Error: '+err));
-        }
-
-        function generateBatch() {
-            const pin = document.getElementById('batchPin').value;
-            
-            const count = 5;
-            fetch('/generate-batch?count='+count+'&pin='+encodeURIComponent(pin))
-            .then(res => res.json())
-            .then(data => {
-                if (data.error) {
-                    document.getElementById('batchResult').innerHTML = '❌ ' + data.error;
-                } else if (data.keys && data.keys.length > 0) {
-                    let html = '<div class="batch-keys">';
-                    data.keys.forEach(k => { html += '<span>🔑 ' + k + '</span>'; });
-                    html += '</div><p style="color:#88ddff;">✅ ' + data.keys.length + ' claves generadas.</p>';
-                    document.getElementById('batchResult').innerHTML = html;
-                    setTimeout(() => location.reload(), 2000);
-                } else {
-                    document.getElementById('batchResult').innerHTML = '<p style="color:#ff8888;">No se generaron claves.</p>';
-                }
-            })
-            .catch(err => alert('Error: '+err));
-        }
-
-        function generarPrueba() {
-            const horas = parseInt(document.getElementById('pruebaHoras').value);
-            const pin = document.getElementById('pruebaPin').value;
-            
-            fetch('/admin/generar-prueba', {
-                method: 'POST',
-                headers: { 'Content-Type': 'application/json' },
-                body: JSON.stringify({ horas, pin })
-            })
-            .then(res => res.json())
-            .then(data => {
-                if (data.error) {
-                    document.getElementById('pruebaResult').innerHTML = '❌ ' + data.error;
-                } else {
-                    document.getElementById('pruebaResult').innerHTML = '✅ Clave de prueba: <code>' + data.key + '</code> (' + data.horas + 'h)';
-                    setTimeout(() => location.reload(), 2000);
-                }
-            })
-            .catch(err => alert('Error: '+err));
-        }
-
-        function hacerReseller() {
-            const email = document.getElementById('resellerEmail').value.trim();
-            const porcentaje = parseInt(document.getElementById('resellerPorcentaje').value) || 25;
-            const pin = document.getElementById('resellerPin').value;
-            if (!email) { alert('Introduce un email'); return; }
-            
-            fetch('/admin/hacer-reseller', {
-                method: 'POST',
-                headers: { 'Content-Type': 'application/json' },
-                body: JSON.stringify({ email, porcentaje })
-            })
-            .then(res => res.json())
-            .then(data => {
-                if (data.error) {
-                    document.getElementById('resellerResult').innerHTML = '❌ ' + data.error;
-                } else {
-                    document.getElementById('resellerResult').innerHTML = '✅ ' + data.message;
-                    setTimeout(() => location.reload(), 1500);
-                }
-            })
-            .catch(err => alert('Error: '+err));
-        }
-
-        function uploadKeys() {
-            const pin = document.getElementById('uploadPin').value;
-            
-            const form = document.getElementById('uploadForm');
-            const formData = new FormData(form);
-            formData.append('pin', pin);
-            fetch('/admin/upload-keys', { method: 'POST', body: formData })
-            .then(res => res.json())
-            .then(data => {
-                document.getElementById('uploadResult').innerHTML = data.message || data.error;
-                if (data.message) setTimeout(() => location.reload(), 2000);
-            })
-            .catch(err => alert('Error: '+err));
-        }
-
-        function doBackup() {
-            if (confirm('¿Realizar backup del KV? Esto puede tomar unos segundos.')) {
-                fetch('/admin/backup', { method: 'POST' })
-                .then(res => res.json())
-                .then(data => alert(data.message))
-                .catch(err => alert('Error: '+err));
-            }
-        }
-
-        const hourlyLabels = ${JSON.stringify(hourlyLabels)};
-        const hourlyData = ${JSON.stringify(hourlyData)};
-        const dailyLabels = ${JSON.stringify(dailyLabels)};
-        const dailyValid = ${JSON.stringify(dailyValid)};
-        const dailyInvalid = ${JSON.stringify(dailyInvalid)};
-
-        new Chart(document.getElementById('hourlyChart'), {
-            type: 'bar',
-            data: {
-                labels: hourlyLabels,
-                datasets: [{ label: 'Verificaciones por hora', data: hourlyData, backgroundColor: 'rgba(0,200,255,0.6)', borderColor: '#00ccff', borderWidth: 1 }]
-            },
-            options: { responsive: true, plugins: { legend: { labels: { color: 'white' } } } }
-        });
-
-        new Chart(document.getElementById('dailyChart'), {
-            type: 'bar',
-            data: {
-                labels: dailyLabels,
-                datasets: [
-                    { label: 'Válidas', data: dailyValid, backgroundColor: 'rgba(0,204,136,0.6)', borderColor: '#00cc88', borderWidth: 1 },
-                    { label: 'Inválidas', data: dailyInvalid, backgroundColor: 'rgba(255,68,68,0.6)', borderColor: '#ff4444', borderWidth: 1 }
-                ]
-            },
-            options: { responsive: true, plugins: { legend: { labels: { color: 'white' } } } }
-        });
-    </script>
-    ${getCookieBannerScript()}
-    ${getLegalFooter()}
-    </body>
-    </html>`;
-    return new Response(html, { headers: { 'Content-Type': 'text/html; charset=utf-8' } });
 }
 
 // ==================================================
@@ -7338,7 +6920,7 @@ async function handleSubscribe(env, request) {
     </div>
     <script>
         function comprarSuscripcion(plan) {
-            const email = '${auth.user.email}';
+            const email = ${JSON.stringify(auth.user.email)};
             fetch('/shop/create-checkout?tipo=suscripcion&plan=' + plan + '&email=' + encodeURIComponent(email))
                 .then(res => res.json())
                 .then(data => {
