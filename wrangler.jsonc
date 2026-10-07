@@ -5,9 +5,10 @@
   "compatibility_date": "2026-09-27",
 
   "vars": {
-    "GEMINI_MODEL": "gemini-3.8-flash",
-    "OPENROUTER_MODEL": "openrouter/free"
-  },
+  "BASE_URL": "https://oceanhud.yoelenmanuelzorrilla.workers.dev",
+  "GEMINI_MODEL": "gemini-3.1-flash-lite",
+  "OPENROUTER_MODEL": "openrouter/free"
+}
 
   "kv_namespaces": [
     {
