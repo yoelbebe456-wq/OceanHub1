@@ -5,12 +5,13 @@
   "compatibility_date": "2026-09-27",
 
   "vars": {
-  "BASE_URL": "https://oceanhud.yoelenmanuelzorrilla.workers.dev",
-  "GEMINI_MODEL": "gemini-3.1-flash-lite",
-  "OPENROUTER_MODEL": "openrouter/free"
-}
+    "BASE_URL": "https://oceanhud.yoelenmanuelzorrilla.workers.dev",
+    "GEMINI_MODEL": "gemini-3.1-flash-lite",
+    "OPENROUTER_MODEL": "openrouter/free",
+    "GEMINI_IMAGE_MODEL": "gemini-3.1-flash-image"
+  },
 
-  "kv_namespaces" [
+  "kv_namespaces": [
     {
       "binding": "STATS",
       "id": "1cf0ffb0625b4852820af0696d71d6c5"
@@ -26,10 +27,10 @@
     ]
   },
 
-  "exports": {
-    "KVLocker": {
-      "type": "durable-object",
-      "storage": "sqlite"
+  "migrations": [
+    {
+      "tag": "v1",
+      "new_sqlite_classes": ["KVLocker"]
     }
-  }
+  ]
 }
