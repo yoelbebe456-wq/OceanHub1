@@ -1,5 +1,5 @@
 // ==================================================
-// 🌊 OCEAN HUB V28.3 (AIR FLOW V13) - NUEVO HOME + WIDGET DE AIR FLOW
+// 🌊 OCEAN HUB V28.4 (AIR FLOW V13.1) - RUTAS POR CADA MODO (QUICK/THINK/RESEARCH/...)
 // Añadido: recuperación de contraseña por email, aviso de compra,
 // historial de inicios de sesión, páginas legales y banner de cookies.
 // FIX: BASE_URL, SENDER_EMAIL y SENDER_NAME ahora desde env.
@@ -3834,6 +3834,57 @@ async function handleAirFlowChatV11(env, request) {
     }
 }
 
+
+// --- Ruta por modo: /air-flow/mode/{MODE} y aliases /air-flow/{mode} ---
+const AF_MODE_ROUTE_ALIASES = {
+    quick: 'QUICK', think: 'THINK', research: 'RESEARCH', code: 'CODE',
+    study: 'STUDY', gaming: 'GAMING', travel: 'TRAVEL', shopping: 'SHOPPING',
+    planner: 'PLANNER', agent: 'AGENT', create: 'CREATE', security: 'SECURITY'
+};
+
+async function handleAirFlowModeRoute(env, request, forcedMode) {
+    const auth = await requireAuth(env, request);
+    if (!auth) return jsonResponse({ error: 'No autorizado' }, 403);
+    if (request.method === 'GET') {
+        return jsonResponse({
+            ok: true,
+            mode: afMode(forcedMode),
+            rule: AF_MODE_RULES[afMode(forcedMode)] || AF_MODE_RULES.QUICK,
+            endpoint: 'POST with { message, history?, model? }'
+        });
+    }
+    if (request.method !== 'POST') return jsonResponse({ error: 'Método no permitido' }, 405);
+    if (!(await afRateLimit(env, request, auth.user.email, 'chat'))) return jsonResponse({ error: 'Demasiados mensajes. Espera un momento.' }, 429);
+    let body;
+    try { body = await request.json(); } catch { return jsonResponse({ error: 'JSON inválido' }, 400); }
+    const message = String(body?.message || '').trim();
+    const mode = afMode(forcedMode || body?.mode);
+    if (!message) return jsonResponse({ error: 'Escribe un mensaje.' }, 400);
+    if (message.length > AF_MAX_MESSAGE_CHARS) return jsonResponse({ error: `El mensaje no puede superar ${AF_MAX_MESSAGE_CHARS} caracteres.` }, 413);
+    if (!env.GEMINI_API_KEY && !env.OPENROUTER_API_KEY) return jsonResponse({ error: 'Air Flow no tiene proveedores configurados.' }, 503);
+    const started = Date.now();
+    try {
+        await afRememberExplicit(env, auth.user.email, message);
+        const memory = await afGetMemory(env, auth.user.email);
+        const memoryItems = [
+            ...(memory.preferences || []).slice(0, 10).map(value => ({ type: 'preference', value })),
+            ...(memory.projects || []).slice(0, 10).map(value => ({ type: 'project', value })),
+            ...(memory.personality || []).slice(0, 5).map(value => ({ type: 'personality', value }))
+        ];
+        const result = await afGenerate(env, body?.history, message, mode, { memories: memoryItems, modelId: String(body?.model || '').slice(0, 80) });
+        const history = afNormalizeMessages([...(body?.history || []), { role: 'user', content: message }, { role: 'assistant', content: result.text }]);
+        await Promise.all([
+            afSaveConversation(env, auth.user.email, history, mode),
+            afLogMetric(env, { request: true, search: result.searched, tokens: result.tokens, latency: Date.now() - started, model: result.model, mode })
+        ]);
+        return jsonResponse({ reply: result.text, provider: result.provider, model: result.model, sources: result.sources || [], searched: !!result.searched, mode });
+    } catch (error) {
+        await afLogMetric(env, { request: true, error: true, latency: Date.now() - started, mode });
+        const code = String(error?.message || 'AIR_FLOW_NO_PROVIDER').replace(/[^A-Z0-9_ \-]/g, '').slice(0, 200) || 'AIR_FLOW_NO_PROVIDER';
+        return jsonResponse({ error: 'Air Flow no pudo responder ahora.', code }, 502);
+    }
+}
+
 async function handleAirFlowVisionV11(env, request) {
     const auth = await requireAuth(env, request);
     if (!auth) return jsonResponse({ error: 'No autorizado' }, 403);
@@ -4485,7 +4536,7 @@ async function sendMessage(forceText){
   addMessage('user',text);state.history.push({role:'user',content:text});
   var wait=thinking();setBusy(true);
   try{
-    var d=await api('/air-flow/chat',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({message:text,history:state.history.slice(0,-1),mode:state.mode,model:state.model||''})});
+    var modePath='/air-flow/mode/'+String(state.mode||'QUICK').toLowerCase();var d=await api(modePath,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({message:text,history:state.history.slice(0,-1),mode:state.mode,model:state.model||''})});
     if(wait)wait.remove();
     addMessage('assistant',d.reply||'No recibí una respuesta.',d.sources||[]);
     state.history.push({role:'assistant',content:d.reply||''});
@@ -7262,6 +7313,24 @@ export async function workerFetch(request, env) {
         if (path === '/' || path === '/home') return await handleHome(env, request);
         if (path === '/home-data') return await handleHomeData(env, request);
         if (path === '/air-flow') return await handleAirFlowPageV11(env, request);
+        // --- Rutas por cada modo de Air Flow ---
+        if (path.startsWith('/air-flow/mode/')) {
+            const modeKey = path.slice('/air-flow/mode/'.length).split('/')[0].toLowerCase();
+            const forced = AF_MODE_ROUTE_ALIASES[modeKey] || modeKey.toUpperCase();
+            if (AF_MODE_RULES[afMode(forced)]) return await handleAirFlowModeRoute(env, request, forced);
+        }
+        if (path === '/air-flow/quick') return await handleAirFlowModeRoute(env, request, 'QUICK');
+        if (path === '/air-flow/think') return await handleAirFlowModeRoute(env, request, 'THINK');
+        if (path === '/air-flow/study') return await handleAirFlowModeRoute(env, request, 'STUDY');
+        if (path === '/air-flow/gaming') return await handleAirFlowModeRoute(env, request, 'GAMING');
+        if (path === '/air-flow/travel') return await handleAirFlowModeRoute(env, request, 'TRAVEL');
+        if (path === '/air-flow/shopping') return await handleAirFlowModeRoute(env, request, 'SHOPPING');
+        if (path === '/air-flow/create') return await handleAirFlowModeRoute(env, request, 'CREATE');
+        // RESEARCH / PLANNER / CODE / AGENT ya tienen rutas especializadas; también aceptan chat por modo:
+        if (path === '/air-flow/mode/research' || path === '/air-flow/mode/planner' || path === '/air-flow/mode/code' || path === '/air-flow/mode/agent') {
+            const modeKey = path.split('/').pop().toLowerCase();
+            return await handleAirFlowModeRoute(env, request, AF_MODE_ROUTE_ALIASES[modeKey] || modeKey.toUpperCase());
+        }
         if (path === '/air-flow/chat' || path === '/air-flow/api/chat') return await handleAirFlowChatV11(env, request);
         if (path === '/air-flow/api/vision') return await handleAirFlowVisionV11(env, request);
         if (path === '/air-flow/api/file') return await handleAirFlowFileV11(env, request);
