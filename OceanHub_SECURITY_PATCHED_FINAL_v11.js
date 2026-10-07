@@ -3678,7 +3678,8 @@ async function afCallGemini(env, messages, mode, options = {}) {
     const latency = Date.now() - started;
     if (!response.ok) {
         console.error('Air Flow Gemini error:', response.status, JSON.stringify(data).slice(0, 1200));
-        throw new Error(`GEMINI_HTTP_${response.status}`);
+        const gst = String(data?.error?.status || '').toUpperCase().replace(/[^A-Z_]/g, '').slice(0, 30);
+        throw new Error(`GEMINI_HTTP_${response.status}${gst ? '_' + gst : ''}`);
     }
     const text = afQualityFilter(afExtractGeminiText(data));
     if (!text) throw new Error('GEMINI_EMPTY_RESPONSE');
@@ -3752,7 +3753,7 @@ async function afGenerate(env, history, message, mode, options = {}) {
         }
     }
     console.error('Air Flow provider router failed:', errors.join(' | '));
-    throw new Error('AIR_FLOW_NO_PROVIDER');
+    throw new Error('AIR_FLOW_NO_PROVIDER ' + errors.join(' ').replace(/[^A-Za-z0-9_ -]/g, ''));
 }
 
 async function handleAirFlowChatV11(env, request) {
@@ -3783,7 +3784,7 @@ async function handleAirFlowChatV11(env, request) {
         return jsonResponse({ reply: result.text, provider: result.provider, model: result.model, sources: result.sources || [], searched: !!result.searched, mode });
     } catch (error) {
         await afLogMetric(env, { request: true, error: true, latency: Date.now() - started, mode });
-        const code = String(error?.message || 'AIR_FLOW_NO_PROVIDER').replace(/[^A-Z0-9_\-]/g, '').slice(0, 80) || 'AIR_FLOW_NO_PROVIDER';
+        const code = String(error?.message || 'AIR_FLOW_NO_PROVIDER').replace(/[^A-Z0-9_ \-]/g, '').slice(0, 200) || 'AIR_FLOW_NO_PROVIDER';
         console.error('Air Flow V11 chat failed:', error?.message || error);
         return jsonResponse({ error: '⚠️ Air Flow no pudo responder ahora.', code }, 502);
     }
