@@ -1,5 +1,5 @@
 // ==================================================
-// 🌊 OCEAN HUB V28.4 (AIR FLOW V13.1) - RUTAS POR CADA MODO (QUICK/THINK/RESEARCH/...)
+// 🌊 OCEAN HUB V28.5 (AIR FLOW V13.2) - FIX CSP/JS + CONVERSACIONES + MÁS MODELOS
 // Añadido: recuperación de contraseña por email, aviso de compra,
 // historial de inicios de sesión, páginas legales y banner de cookies.
 // FIX: BASE_URL, SENDER_EMAIL y SENDER_NAME ahora desde env.
@@ -3409,7 +3409,7 @@ const AF_MAX_HISTORY_CHARS = 28000;
 const AF_MAX_UPLOAD_BYTES = 10 * 1024 * 1024;
 const AF_RATE_WINDOW = 60;
 const AF_RATE_MAX = 20;
-const AF_GEMINI_MODEL_DEFAULT = 'gemini-3.8-flash';
+const AF_GEMINI_MODEL_DEFAULT = 'gemini-2.5-flash';
 const AF_OPENROUTER_MODEL_DEFAULT = 'openrouter/free';
 const AF_LIVE_MODEL_DEFAULT = 'gemini-3.8-live';
 const AF_IMAGE_MODEL_DEFAULT = 'gemini-nano-banana-2.1';
@@ -3591,20 +3591,38 @@ async function afRememberExplicit(env, email, message) {
     return true;
 }
 
-async function afSaveConversation(env, email, history, mode = 'QUICK') {
+async function afSaveConversation(env, email, history, mode = 'QUICK', conversationId = null) {
     const safe = await hashKey(String(email || '').toLowerCase());
     const key = `af_conversations_${safe}`;
     const current = await env.STATS.get(key, 'json') || [];
     const normalized = afNormalizeMessages(history).slice(-AF_MAX_HISTORY_MESSAGES);
+    if (!normalized.length) return null;
     const firstUser = normalized.find(x => x.role === 'user');
-    const item = {
-        id: crypto.randomUUID(),
-        title: String(firstUser?.content || 'Nueva conversación').slice(0, 90),
-        mode: afMode(mode),
-        updated_at: new Date().toISOString(),
-        messages: normalized
-    };
-    const merged = [item, ...current.filter(x => x?.title !== item.title || x?.mode !== item.mode)].slice(0, AF_MAX_CONVERSATIONS);
+    const title = String(firstUser?.content || 'Nueva conversación').slice(0, 90);
+    const modeN = afMode(mode);
+    const now = new Date().toISOString();
+    let item = null;
+    let rest = current;
+    // Reutilizar conversación por id explícito o por título+modo recientes
+    if (conversationId) {
+        const idx = current.findIndex(x => String(x?.id || '') === String(conversationId));
+        if (idx >= 0) {
+            item = { ...current[idx], title: current[idx].title || title, mode: modeN, updated_at: now, messages: normalized };
+            rest = current.filter((_, i) => i !== idx);
+        }
+    }
+    if (!item) {
+        const idx = current.findIndex(x => x?.title === title && afMode(x?.mode) === modeN);
+        if (idx >= 0) {
+            item = { ...current[idx], mode: modeN, updated_at: now, messages: normalized };
+            rest = current.filter((_, i) => i !== idx);
+        }
+    }
+    if (!item) {
+        item = { id: crypto.randomUUID(), title, mode: modeN, updated_at: now, messages: normalized };
+        rest = current;
+    }
+    const merged = [item, ...rest].slice(0, AF_MAX_CONVERSATIONS);
     await env.STATS.put(key, JSON.stringify(merged), { expirationTtl: AF_MEMORY_TTL });
     return item;
 }
@@ -3739,20 +3757,59 @@ async function afCallOpenRouter(env, messages, mode, options = {}) {
 }
 
 const AF_MODEL_CATALOG = [
-    { id: 'gemini-3.8-flash', label: 'Gemini 3.8 Flash', provider: 'gemini' },
+    // Gemini
+    { id: 'gemini-2.5-flash', label: 'Gemini 2.5 Flash', provider: 'gemini' },
+    { id: 'gemini-2.5-pro', label: 'Gemini 2.5 Pro', provider: 'gemini' },
+    { id: 'gemini-2.0-flash', label: 'Gemini 2.0 Flash', provider: 'gemini' },
+    { id: 'gemini-2.0-flash-lite', label: 'Gemini 2.0 Flash-Lite', provider: 'gemini' },
+    { id: 'gemini-1.5-flash', label: 'Gemini 1.5 Flash', provider: 'gemini' },
+    { id: 'gemini-1.5-pro', label: 'Gemini 1.5 Pro', provider: 'gemini' },
+    { id: 'gemini-3.1-flash-lite', label: 'Gemini 3.1 Flash-Lite', provider: 'gemini' },
     { id: 'gemini-3.7-flash', label: 'Gemini 3.7 Flash', provider: 'gemini' },
-    { id: 'gemini-3.1-flash-lite', label: 'Gemini 3.1 Flash-Lite (rápido)', provider: 'gemini' },
-    { id: 'openrouter/free', label: 'OpenRouter · Free', provider: 'openrouter' }
+    { id: 'gemini-3.8-flash', label: 'Gemini 3.8 Flash', provider: 'gemini' },
+    // OpenRouter — gratis / baratos
+    { id: 'openrouter/free', label: 'OpenRouter · Free', provider: 'openrouter' },
+    { id: 'google/gemini-2.0-flash-exp:free', label: 'OR · Gemini 2.0 Flash Exp Free', provider: 'openrouter' },
+    { id: 'google/gemini-2.5-flash-preview:free', label: 'OR · Gemini 2.5 Flash Free', provider: 'openrouter' },
+    { id: 'meta-llama/llama-3.3-70b-instruct:free', label: 'OR · Llama 3.3 70B Free', provider: 'openrouter' },
+    { id: 'meta-llama/llama-3.2-3b-instruct:free', label: 'OR · Llama 3.2 3B Free', provider: 'openrouter' },
+    { id: 'qwen/qwen-2.5-72b-instruct:free', label: 'OR · Qwen 2.5 72B Free', provider: 'openrouter' },
+    { id: 'qwen/qwen3-4b:free', label: 'OR · Qwen3 4B Free', provider: 'openrouter' },
+    { id: 'deepseek/deepseek-r1:free', label: 'OR · DeepSeek R1 Free', provider: 'openrouter' },
+    { id: 'deepseek/deepseek-chat-v3-0324:free', label: 'OR · DeepSeek V3 Free', provider: 'openrouter' },
+    { id: 'mistralai/mistral-small-3.1-24b-instruct:free', label: 'OR · Mistral Small Free', provider: 'openrouter' },
+    { id: 'microsoft/phi-4-reasoning:free', label: 'OR · Phi-4 Reasoning Free', provider: 'openrouter' },
+    { id: 'nvidia/llama-3.1-nemotron-ultra-253b-v1:free', label: 'OR · Nemotron Ultra Free', provider: 'openrouter' },
+    // OpenRouter — premium (requiere créditos)
+    { id: 'openai/gpt-4o-mini', label: 'OR · GPT-4o Mini', provider: 'openrouter' },
+    { id: 'openai/gpt-4o', label: 'OR · GPT-4o', provider: 'openrouter' },
+    { id: 'anthropic/claude-3.5-sonnet', label: 'OR · Claude 3.5 Sonnet', provider: 'openrouter' },
+    { id: 'anthropic/claude-sonnet-4', label: 'OR · Claude Sonnet 4', provider: 'openrouter' },
+    { id: 'google/gemini-2.5-pro', label: 'OR · Gemini 2.5 Pro', provider: 'openrouter' },
+    { id: 'x-ai/grok-3-mini', label: 'OR · Grok 3 Mini', provider: 'openrouter' },
+    { id: 'x-ai/grok-3', label: 'OR · Grok 3', provider: 'openrouter' }
 ];
 
-// Más modelos sin tocar código: variable AF_EXTRA_MODELS = [{"id":"...","label":"...","provider":"gemini"|"openrouter"}]
+// Variables Cloudflare (vars / secrets):
+//   AF_EXTRA_MODELS = [{"id":"modelo/id","label":"Nombre","provider":"gemini"|"openrouter"}]
+//   GEMINI_MODEL / OPENROUTER_MODEL = modelo por defecto
+//   AF_ALLOWED_MODELS = "id1,id2" (opcional: filtrar solo estos)
 function afCatalog(env) {
     let extra = [];
     try { extra = JSON.parse(env.AF_EXTRA_MODELS || '[]'); } catch (_) {}
     if (!Array.isArray(extra)) extra = [];
     const more = extra.filter(m => m && m.id && ['gemini', 'openrouter'].includes(m.provider))
-        .map(m => ({ id: String(m.id).slice(0, 80), label: String(m.label || m.id).slice(0, 60), provider: m.provider }));
-    return [...AF_MODEL_CATALOG, ...more.filter(m => !AF_MODEL_CATALOG.some(c => c.id === m.id))];
+        .map(m => ({ id: String(m.id).slice(0, 120), label: String(m.label || m.id).slice(0, 80), provider: m.provider }));
+    let list = [...AF_MODEL_CATALOG, ...more.filter(m => !AF_MODEL_CATALOG.some(c => c.id === m.id))];
+    // Defaults desde env
+    const gDef = String(env.GEMINI_MODEL || '').trim();
+    const oDef = String(env.OPENROUTER_MODEL || '').trim();
+    if (gDef && !list.some(m => m.id === gDef)) list.unshift({ id: gDef, label: gDef + ' (env)', provider: 'gemini' });
+    if (oDef && !list.some(m => m.id === oDef)) list.unshift({ id: oDef, label: oDef + ' (env)', provider: 'openrouter' });
+    // Filtro opcional
+    const allowed = String(env.AF_ALLOWED_MODELS || '').split(',').map(s => s.trim()).filter(Boolean);
+    if (allowed.length) list = list.filter(m => allowed.includes(m.id));
+    return list;
 }
 
 async function handleAirFlowModelsV13(env, request) {
@@ -3821,11 +3878,10 @@ async function handleAirFlowChatV11(env, request) {
         ];
         const result = await afGenerate(env, body?.history, message, mode, { memories: memoryItems, modelId: String(body?.model || '').slice(0, 80) });
         const history = afNormalizeMessages([...(body?.history || []), { role: 'user', content: message }, { role: 'assistant', content: result.text }]);
-        await Promise.all([
-            afSaveConversation(env, auth.user.email, history, mode),
-            afLogMetric(env, { request: true, search: result.searched, tokens: result.tokens, latency: Date.now() - started, model: result.model, mode })
-        ]);
-        return jsonResponse({ reply: result.text, provider: result.provider, model: result.model, sources: result.sources || [], searched: !!result.searched, mode });
+        const conversationId = String(body?.conversationId || body?.conversation_id || '').trim() || null;
+        const saved = await afSaveConversation(env, auth.user.email, history, mode, conversationId);
+        await afLogMetric(env, { request: true, search: result.searched, tokens: result.tokens, latency: Date.now() - started, model: result.model, mode });
+        return jsonResponse({ reply: result.text, provider: result.provider, model: result.model, sources: result.sources || [], searched: !!result.searched, mode, conversationId: saved?.id || null });
     } catch (error) {
         await afLogMetric(env, { request: true, error: true, latency: Date.now() - started, mode });
         const code = String(error?.message || 'AIR_FLOW_NO_PROVIDER').replace(/[^A-Z0-9_ \-]/g, '').slice(0, 200) || 'AIR_FLOW_NO_PROVIDER';
@@ -3873,11 +3929,10 @@ async function handleAirFlowModeRoute(env, request, forcedMode) {
         ];
         const result = await afGenerate(env, body?.history, message, mode, { memories: memoryItems, modelId: String(body?.model || '').slice(0, 80) });
         const history = afNormalizeMessages([...(body?.history || []), { role: 'user', content: message }, { role: 'assistant', content: result.text }]);
-        await Promise.all([
-            afSaveConversation(env, auth.user.email, history, mode),
-            afLogMetric(env, { request: true, search: result.searched, tokens: result.tokens, latency: Date.now() - started, model: result.model, mode })
-        ]);
-        return jsonResponse({ reply: result.text, provider: result.provider, model: result.model, sources: result.sources || [], searched: !!result.searched, mode });
+        const conversationId = String(body?.conversationId || body?.conversation_id || '').trim() || null;
+        const saved = await afSaveConversation(env, auth.user.email, history, mode, conversationId);
+        await afLogMetric(env, { request: true, search: result.searched, tokens: result.tokens, latency: Date.now() - started, model: result.model, mode });
+        return jsonResponse({ reply: result.text, provider: result.provider, model: result.model, sources: result.sources || [], searched: !!result.searched, mode, conversationId: saved?.id || null });
     } catch (error) {
         await afLogMetric(env, { request: true, error: true, latency: Date.now() - started, mode });
         const code = String(error?.message || 'AIR_FLOW_NO_PROVIDER').replace(/[^A-Z0-9_ \-]/g, '').slice(0, 200) || 'AIR_FLOW_NO_PROVIDER';
@@ -4481,7 +4536,7 @@ async function handleAirFlowPageV11(env, request) {
 <script>
 (function(){
 'use strict';
-var state={mode:'QUICK',history:[],busy:false,filePurpose:'files',liveSocket:null,audioContext:null,nextAudioTime:0,conversations:[],micStream:null,micContext:null,micSource:null,micProcessor:null,micGain:null};
+var state={mode:'QUICK',history:[],busy:false,filePurpose:'files',liveSocket:null,audioContext:null,nextAudioTime:0,conversations:[],conversationId:null,model:'',micStream:null,micContext:null,micSource:null,micProcessor:null,micGain:null};
 var $=function(id){return document.getElementById(id)};
 var messages=$('messages'), input=$('input'), send=$('send'), file=$('file'), overlay=$('overlay'), drawer=$('drawer'), recents=$('recents'), sidebar=$('sidebar');
 function esc(s){var d=document.createElement('div');d.textContent=String(s==null?'':s);return d.innerHTML;}
@@ -4525,7 +4580,7 @@ function thinking(){removeEmpty();var d=document.createElement('div');d.classNam
 function setBusy(v){state.busy=v;send.disabled=v;input.disabled=v;document.querySelectorAll('.mode-select,.chip').forEach(function(b){b.disabled=v});if(!v)input.focus();}
 async function api(url,options){var res=await fetch(url,Object.assign({credentials:'same-origin',cache:'no-store'},options||{}));var data=await res.json().catch(function(){return {};});if(!res.ok)throw new Error(data.error||('HTTP '+res.status));return data;}
 function selectMode(mode){state.mode=String(mode||'QUICK').toUpperCase();document.querySelectorAll('[data-mode]').forEach(function(b){b.classList.toggle('active',b.dataset.mode===state.mode)});input.placeholder='Pregunta lo que quieras… · '+state.mode;}
-function clearChat(){state.history=[];messages.innerHTML='<div class="empty" id="emptyState"><div class="empty-card"><div class="empty-orb">✈</div><h2>¿Qué hacemos hoy?</h2><p>Puedo conversar, investigar con información actual, revisar código, analizar imágenes y archivos, crear imágenes, organizar planes y ayudarte con tus proyectos.</p><div class="suggestions"><button class="suggestion" data-suggest="Investiga qué hay de nuevo hoy en tecnología.">🌐 Investigar algo actual</button><button class="suggestion" data-suggest="Ayúdame a corregir este código y dime qué está mal.">💻 Revisar código</button><button class="suggestion" data-suggest="Dame ideas de juegos y proyectos que pueda crear.">🎮 Ideas para un proyecto</button><button class="suggestion" data-suggest="Organiza esta idea en un plan paso a paso.">📅 Crear un plan</button></div></div></div>';bindSuggestions();}
+function clearChat(){state.history=[];state.conversationId=null;messages.innerHTML='<div class="empty" id="emptyState"><div class="empty-card"><div class="empty-orb">✈</div><h2>¿Qué hacemos hoy?</h2><p>Puedo conversar, investigar con información actual, revisar código, analizar imágenes y archivos, crear imágenes, organizar planes y ayudarte con tus proyectos.</p><div class="suggestions"><button class="suggestion" data-suggest="Investiga qué hay de nuevo hoy en tecnología.">🌐 Investigar algo actual</button><button class="suggestion" data-suggest="Ayúdame a corregir este código y dime qué está mal.">💻 Revisar código</button><button class="suggestion" data-suggest="Dame ideas de juegos y proyectos que pueda crear.">🎮 Ideas para un proyecto</button><button class="suggestion" data-suggest="Organiza esta idea en un plan paso a paso.">📅 Crear un plan</button></div></div></div>';bindSuggestions();}
 async function sendMessage(forceText){
   if(state.busy)return;
   var text=String(forceText==null?input.value:'').trim();
@@ -4536,8 +4591,10 @@ async function sendMessage(forceText){
   addMessage('user',text);state.history.push({role:'user',content:text});
   var wait=thinking();setBusy(true);
   try{
-    var modePath='/air-flow/mode/'+String(state.mode||'QUICK').toLowerCase();var d=await api(modePath,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({message:text,history:state.history.slice(0,-1),mode:state.mode,model:state.model||''})});
+    var modePath='/air-flow/mode/'+String(state.mode||'QUICK').toLowerCase();
+    var d=await api(modePath,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({message:text,history:state.history.slice(0,-1),mode:state.mode,model:state.model||'',conversationId:state.conversationId||null})});
     if(wait)wait.remove();
+    if(d.conversationId)state.conversationId=d.conversationId;
     addMessage('assistant',d.reply||'No recibí una respuesta.',d.sources||[]);
     state.history.push({role:'assistant',content:d.reply||''});
     if(state.history.length>16)state.history=state.history.slice(-16);
@@ -4553,8 +4610,8 @@ function showToast(text){var t=document.createElement('div');t.textContent=text;
 function openDrawer(title,body){drawer.innerHTML='<div class="drawer-head"><h3>'+esc(title)+'</h3><button class="close" id="drawerClose">×</button></div><div class="drawer-body">'+body+'</div>';overlay.classList.add('show');$('drawerClose').onclick=closeDrawer;}
 function closeDrawer(){overlay.classList.remove('show');if(state.liveSocket){try{state.liveSocket.close()}catch(e){}state.liveSocket=null;}}
 async function statusPanel(){try{var d=await api('/air-flow/status');openDrawer('◉ Estado de Air Flow','<div class="result">Proveedor Gemini: '+(d.providers?.gemini?'✅ configurado':'❌ no configurado')+'\\nProveedor OpenRouter: '+(d.providers?.openrouter?'✅ configurado':'❌ no configurado')+'\\n\\nModelo principal: '+esc(d.models?.gemini||'—')+'\\nModelo Live: '+esc(d.models?.live||'—')+'\\nModelo de imágenes: '+esc(d.models?.image||'—')+'\\n\\nCapacidades: '+esc((d.capabilities||[]).join(', '))+'</div>')}catch(e){openDrawer('◉ Estado de Air Flow','<div class="result">⚠️ '+esc(e.message)+'</div>')}}
-async function loadRecent(){try{var d=await api('/air-flow/conversations');state.conversations=Array.isArray(d.conversations)?d.conversations:[];renderRecent()}catch(e){recents.innerHTML='<div style="padding:10px;color:#607a92;font-size:10px">No se pudo cargar el historial.</div>'}}
-function renderRecent(){if(!state.conversations.length){recents.innerHTML='<div style="padding:10px;color:#607a92;font-size:10px">Todavía no hay conversaciones.</div>';return}recents.innerHTML='';state.conversations.forEach(function(c){var b=document.createElement('div');b.className='recent';b.tabIndex=0;b.innerHTML='<span style="color:#4bbfff">•</span><span style="min-width:0;flex:1"><span class="recent-title">'+esc(c.title||'Nueva conversación')+'</span><span class="recent-mode">'+esc(c.mode||'QUICK')+'</span></span><button class="recent-delete" title="Eliminar" data-delete="'+esc(c.id||'')+'">×</button>';b.addEventListener('click',function(e){if(e.target.dataset.delete)return;state.history=Array.isArray(c.messages)?c.messages.slice(-16):[];clearChat();state.history.forEach(function(m){if(m.role==='user')addMessage('user',m.content);else addMessage('assistant',m.content)});selectMode(c.mode||'QUICK');sidebar.classList.remove('open');});b.addEventListener('keydown',function(e){if((e.key==='Enter'||e.key===' ')&&!e.target.dataset.delete){e.preventDefault();b.click();}});var del=b.querySelector('[data-delete]');if(del)del.addEventListener('click',async function(e){e.stopPropagation();var id=del.dataset.delete;if(!id)return;try{await api('/air-flow/conversations?id='+encodeURIComponent(id),{method:'DELETE'});await loadRecent();}catch(err){showToast(err.message)}});recents.appendChild(b)});}
+async function loadRecent(){try{var d=await api('/air-flow/conversations');state.conversations=Array.isArray(d.conversations)?d.conversations:[];renderRecent()}catch(e){recents.innerHTML='<div style="padding:10px;color:#607a92;font-size:10px">No se pudo cargar el historial: '+esc(e.message||'error')+'</div>'}}
+function renderRecent(){if(!state.conversations.length){recents.innerHTML='<div style="padding:10px;color:#607a92;font-size:10px">Todavía no hay conversaciones.</div>';return}recents.innerHTML='';state.conversations.forEach(function(c){var b=document.createElement('div');b.className='recent';b.tabIndex=0;b.innerHTML='<span style="color:#4bbfff">•</span><span style="min-width:0;flex:1"><span class="recent-title">'+esc(c.title||'Nueva conversación')+'</span><span class="recent-mode">'+esc(c.mode||'QUICK')+'</span></span><button class="recent-delete" title="Eliminar" data-delete="'+esc(c.id||'')+'">×</button>';b.addEventListener('click',function(e){if(e.target.dataset.delete)return;var msgs=Array.isArray(c.messages)?c.messages.slice(-16):[];state.history=msgs;state.conversationId=c.id||null;messages.innerHTML='';if(!msgs.length){clearChat();return}msgs.forEach(function(m){if(m.role==='user')addMessage('user',m.content);else addMessage('assistant',m.content)});selectMode(c.mode||'QUICK');sidebar.classList.remove('open');});b.addEventListener('keydown',function(e){if((e.key==='Enter'||e.key===' ')&&!e.target.dataset.delete){e.preventDefault();b.click();}});var del=b.querySelector('[data-delete]');if(del)del.addEventListener('click',async function(e){e.stopPropagation();var id=del.dataset.delete;if(!id)return;try{await api('/air-flow/conversations?id='+encodeURIComponent(id),{method:'DELETE'});await loadRecent();}catch(err){showToast(err.message)}});recents.appendChild(b)});}
 function resizeInput(){input.style.height='auto';input.style.height=Math.min(input.scrollHeight,150)+'px'}
 function chooseFile(kind){state.filePurpose=kind;file.value='';file.removeAttribute('capture');file.accept=kind==='vision'?'image/*':'image/*,.pdf,.txt,.md,.csv,.json,.js,.ts,.html,.css,.py,.lua,.xml,.yaml,.yml,.log';if(kind==='camera'){state.filePurpose='vision';file.accept='image/*';file.setAttribute('capture','environment')}file.click()}
 function readFile(f){return new Promise(function(resolve,reject){var r=new FileReader();r.onload=function(){resolve(r.result)};r.onerror=function(){reject(new Error('No pude leer el archivo.'))};r.readAsDataURL(f)})}
@@ -7505,9 +7562,10 @@ export async function workerFetch(request, env) {
 
 async function applySecurityHeaders(response) {
     const headers = new Headers(response.headers);
-    const nonceBytes = new Uint8Array(18);
+    // Nonce URL-safe (sin + / =) para evitar problemas con CSP
+    const nonceBytes = new Uint8Array(16);
     crypto.getRandomValues(nonceBytes);
-    const nonce = btoa(String.fromCharCode(...nonceBytes));
+    const nonce = Array.from(nonceBytes, b => b.toString(16).padStart(2, '0')).join('');
     const contentType = headers.get('Content-Type') || '';
     let body = response.body;
     if (contentType.includes('text/html')) {
@@ -7515,8 +7573,28 @@ async function applySecurityHeaders(response) {
         html = html.replace(/<script(?![^>]*\bnonce=)/gi, `<script nonce="${nonce}"`);
         html = html.replace(/<style(?![^>]*\bnonce=)/gi, `<style nonce="${nonce}"`);
         body = html;
+        // CRÍTICO: quitar Content-Length viejo; el body creció con los nonces
+        headers.delete('Content-Length');
+        headers.delete('content-length');
     }
-    headers.set('Content-Security-Policy', `default-src 'self'; base-uri 'self'; object-src 'none'; frame-ancestors 'none'; form-action 'self'; script-src 'self' 'nonce-${nonce}' https://cdn.jsdelivr.net https://cdnjs.cloudflare.com https://www.paypal.com https://www.paypalobjects.com; script-src-attr 'unsafe-inline'; style-src 'self' 'nonce-${nonce}' https://fonts.googleapis.com; style-src-attr 'unsafe-inline'; img-src 'self' data: https:; font-src 'self' data: https://fonts.gstatic.com; connect-src 'self' https://generativelanguage.googleapis.com wss://generativelanguage.googleapis.com https://api-m.paypal.com https://api.brevo.com; frame-src 'self' https://www.paypal.com; upgrade-insecure-requests`);
+    headers.set('Content-Security-Policy', [
+        "default-src 'self'",
+        "base-uri 'self'",
+        "object-src 'none'",
+        "frame-ancestors 'none'",
+        "form-action 'self'",
+        `script-src 'self' 'nonce-${nonce}' https://cdn.jsdelivr.net https://cdnjs.cloudflare.com https://www.paypal.com https://www.paypalobjects.com`,
+        "script-src-attr 'unsafe-inline'",
+        `style-src 'self' 'unsafe-inline' 'nonce-${nonce}' https://fonts.googleapis.com`,
+        "style-src-attr 'unsafe-inline'",
+        "img-src 'self' data: blob: https:",
+        "font-src 'self' data: https://fonts.gstatic.com",
+        "connect-src 'self' https://generativelanguage.googleapis.com wss://generativelanguage.googleapis.com https://openrouter.ai https://api.openrouter.ai https://api-m.paypal.com https://api-m.sandbox.paypal.com https://api.brevo.com",
+        "frame-src 'self' https://www.paypal.com",
+        "media-src 'self' blob:",
+        "worker-src 'self' blob:",
+        "upgrade-insecure-requests"
+    ].join('; '));
     headers.set('X-Content-Type-Options', 'nosniff');
     headers.set('Referrer-Policy', 'strict-origin-when-cross-origin');
     headers.set('Permissions-Policy', 'camera=(self), microphone=(self), geolocation=()');
