@@ -4498,7 +4498,10 @@ async function afReadFileAsText(data, mime) {
     try {
         const binary = atob(clean);
         const bytes = Uint8Array.from(binary, c => c.charCodeAt(0));
-        const text = new TextDecoder('utf-8', { fatal: false }).decode(bytes);
+       const text = new TextDecoder('utf-8', {
+    fatal: false,
+    ignoreBOM: false
+}).decode(bytes);
         return text.length <= 120000 ? text : text.slice(0, 120000);
     } catch { return null; }
 }
