@@ -1,5 +1,5 @@
 // ==================================================
-// 🌊 OCEAN HUB V28.6 (AIR FLOW V13.3) - CSP SIN NONCE + APP.JS EXTERNO + FALLBACKS IA
+// 🌊 OCEAN HUB V29.0 — SOCIAL: perfiles /Profile/user, verificación, amigos, bloqueo, DM
 // Añadido: recuperación de contraseña por email, aviso de compra,
 // historial de inicios de sesión, páginas legales y banner de cookies.
 // FIX: BASE_URL, SENDER_EMAIL y SENDER_NAME ahora desde env.
@@ -384,13 +384,17 @@ async function createUser(env, email, name, password, referralCode = null) {
     // El registro público nunca concede rol admin.
     role = 'user';
     const ownReferralCode = generateRandomHex(8).toUpperCase();
+    const baseName = (name || email.split('@')[0] || 'user').trim();
+    const username = await socialEnsureUniqueUsername(env, baseName);
     const user = {
-        email, name: name || email.split('@')[0], passwordHash, salt, role,
+        email, name: baseName.slice(0, 80), username, passwordHash, salt, role,
         created_at: new Date().toISOString(), last_login: null,
         referral_code: ownReferralCode, referido_por: referralCode || null,
-        points: 0, otp_secret: null, dark_mode: false, language: 'es', sessionVersion: 0
+        points: 0, otp_secret: null, dark_mode: false, language: 'es', sessionVersion: 0,
+        verified: false, bio: '', avatar_emoji: '👤'
     };
     await env.STATS.put(`user_${email}`, JSON.stringify(user));
+    await env.STATS.put(`username_${username.toLowerCase()}`, email);
     userList.push(email);
     await env.STATS.put('user_list', JSON.stringify(userList));
 
@@ -7265,12 +7269,572 @@ function isPublicRoute(path) {
     if (path.startsWith('/verify/')) return true;
     if (path.startsWith('/auth/')) return true;
     if (path.startsWith('/s/')) return true;
+    if (path.startsWith('/Profile/') || path.startsWith('/profile/') || path.startsWith('/u/')) return true;
     return false;
 }
 
 // ==================================================
 // [ MANEJADOR PRINCIPAL ]
 // ==================================================
+
+// ==================================================
+// [ 👥 SOCIAL — PERFILES / VERIFICACIÓN / AMIGOS / BLOQUEO / DM ]
+// ==================================================
+
+const SOCIAL_MAX_FRIENDS = 200;
+const SOCIAL_MAX_BLOCKS = 200;
+const SOCIAL_MAX_DM_MESSAGES = 200;
+const SOCIAL_MAX_DM_THREADS = 50;
+const SOCIAL_DM_MAX_LEN = 2000;
+
+function socialSlugify(raw) {
+    let s = String(raw || 'user').normalize('NFD').replace(/[\u0300-\u036f]/g, '');
+    s = s.replace(/[^a-zA-Z0-9_]/g, '').slice(0, 24);
+    if (!s || /^\d+$/.test(s)) s = 'user' + s;
+    if (!/^[a-zA-Z]/.test(s)) s = 'u' + s;
+    return s.slice(0, 24) || 'user';
+}
+
+async function socialEnsureUniqueUsername(env, baseName) {
+    let base = socialSlugify(baseName);
+    for (let i = 0; i < 30; i++) {
+        const candidate = i === 0 ? base : `${base.slice(0, 18)}${i}`;
+        const taken = await env.STATS.get(`username_${candidate.toLowerCase()}`);
+        if (!taken) return candidate;
+    }
+    return socialSlugify(base + generateRandomHex(4));
+}
+
+async function socialGetUserByUsername(env, username) {
+    const slug = socialSlugify(username);
+    if (!slug) return null;
+    const email = await env.STATS.get(`username_${slug.toLowerCase()}`);
+    if (email) return await getUserByEmail(env, email);
+    const list = await env.STATS.get('user_list', 'json') || [];
+    const want = String(username || '').trim().toLowerCase();
+    for (const em of list.slice(0, 5000)) {
+        const u = await getUserByEmail(env, em);
+        if (!u) continue;
+        if (String(u.username || '').toLowerCase() === want) return u;
+        if (!u.username && String(u.name || '').toLowerCase() === want) {
+            const un = await socialEnsureUniqueUsername(env, u.name || em.split('@')[0]);
+            u.username = un;
+            if (typeof u.verified !== 'boolean') u.verified = false;
+            await env.STATS.put(`user_${u.email}`, JSON.stringify(u));
+            await env.STATS.put(`username_${un.toLowerCase()}`, u.email);
+            return u;
+        }
+    }
+    return null;
+}
+
+async function socialEnsureUserMeta(env, user) {
+    if (!user) return null;
+    let changed = false;
+    if (!user.username) {
+        user.username = await socialEnsureUniqueUsername(env, user.name || user.email?.split('@')[0] || 'user');
+        await env.STATS.put(`username_${user.username.toLowerCase()}`, user.email);
+        changed = true;
+    }
+    if (typeof user.verified !== 'boolean') { user.verified = false; changed = true; }
+    if (typeof user.bio !== 'string') { user.bio = ''; changed = true; }
+    if (!user.avatar_emoji) { user.avatar_emoji = '👤'; changed = true; }
+    if (changed) await env.STATS.put(`user_${user.email}`, JSON.stringify(user));
+    return user;
+}
+
+async function socialSaveUser(env, user) {
+    await env.STATS.put(`user_${user.email}`, JSON.stringify(user));
+    if (user.username) await env.STATS.put(`username_${String(user.username).toLowerCase()}`, user.email);
+}
+
+function socialPublicUser(user) {
+    if (!user) return null;
+    return {
+        username: user.username || socialSlugify(user.name || 'user'),
+        name: user.name || user.username || 'Usuario',
+        verified: !!user.verified,
+        bio: String(user.bio || '').slice(0, 280),
+        avatar_emoji: user.avatar_emoji || '👤',
+        created_at: user.created_at || null,
+        role: user.role === 'admin' ? 'admin' : 'user'
+    };
+}
+
+async function socialGetFriends(env, email) {
+    return await env.STATS.get(`friends_${String(email).toLowerCase()}`, 'json') || { outgoing: [], incoming: [], accepted: [] };
+}
+
+async function socialSaveFriends(env, email, data) {
+    const clean = {
+        outgoing: Array.isArray(data.outgoing) ? [...new Set(data.outgoing)].slice(0, SOCIAL_MAX_FRIENDS) : [],
+        incoming: Array.isArray(data.incoming) ? [...new Set(data.incoming)].slice(0, SOCIAL_MAX_FRIENDS) : [],
+        accepted: Array.isArray(data.accepted) ? [...new Set(data.accepted)].slice(0, SOCIAL_MAX_FRIENDS) : []
+    };
+    await env.STATS.put(`friends_${String(email).toLowerCase()}`, JSON.stringify(clean));
+    return clean;
+}
+
+async function socialGetBlocks(env, email) {
+    return await env.STATS.get(`blocks_${String(email).toLowerCase()}`, 'json') || [];
+}
+
+async function socialSaveBlocks(env, email, list) {
+    const clean = [...new Set((list || []).map(x => String(x).toLowerCase()))].slice(0, SOCIAL_MAX_BLOCKS);
+    await env.STATS.put(`blocks_${String(email).toLowerCase()}`, JSON.stringify(clean));
+    return clean;
+}
+
+async function socialIsBlockedEither(env, a, b) {
+    const ea = String(a).toLowerCase();
+    const eb = String(b).toLowerCase();
+    const ba = await socialGetBlocks(env, ea);
+    const bb = await socialGetBlocks(env, eb);
+    return ba.includes(eb) || bb.includes(ea);
+}
+
+async function socialAreFriends(env, a, b) {
+    const fa = await socialGetFriends(env, a);
+    return (fa.accepted || []).includes(String(b).toLowerCase());
+}
+
+function socialDmKey(emailA, emailB) {
+    const pair = [String(emailA).toLowerCase(), String(emailB).toLowerCase()].sort();
+    return `dm_${pair[0]}__${pair[1]}`;
+}
+
+async function socialGetDmThread(env, emailA, emailB) {
+    return await env.STATS.get(socialDmKey(emailA, emailB), 'json') || { messages: [] };
+}
+
+async function socialSaveDmThread(env, emailA, emailB, thread) {
+    const messages = Array.isArray(thread.messages) ? thread.messages.slice(-SOCIAL_MAX_DM_MESSAGES) : [];
+    await env.STATS.put(socialDmKey(emailA, emailB), JSON.stringify({ messages, updated_at: new Date().toISOString() }));
+}
+
+async function socialTouchInbox(env, ownerEmail, peerEmail, lastText) {
+    const key = `dm_inbox_${String(ownerEmail).toLowerCase()}`;
+    const inbox = await env.STATS.get(key, 'json') || [];
+    const peer = String(peerEmail).toLowerCase();
+    const next = [{ peer, last: String(lastText || '').slice(0, 120), at: new Date().toISOString() }, ...inbox.filter(x => x.peer !== peer)].slice(0, SOCIAL_MAX_DM_THREADS);
+    await env.STATS.put(key, JSON.stringify(next));
+}
+
+
+async function handleAdminVerifyUser(env, request) {
+    const auth = await requireAdmin(env, request);
+    if (!auth) return jsonResponse({ error: 'No autorizado' }, 403);
+    if (request.method !== 'POST') return jsonResponse({ error: 'Método no permitido' }, 405);
+    let body; try { body = await request.json(); } catch { return jsonResponse({ error: 'JSON inválido' }, 400); }
+    const target = String(body?.username || body?.email || '').trim();
+    if (!target) return jsonResponse({ error: 'Indica username o email' }, 400);
+    let user = target.includes('@') ? await getUserByEmail(env, target.toLowerCase()) : await socialGetUserByUsername(env, target);
+    if (!user) return jsonResponse({ error: 'Usuario no encontrado' }, 404);
+    user = await socialEnsureUserMeta(env, user);
+    const verified = body?.verified === false || body?.verified === 'false' || body?.action === 'unverify' ? false : true;
+    user.verified = verified;
+    await socialSaveUser(env, user);
+    return jsonResponse({ ok: true, username: user.username, email: user.email, verified: user.verified, profile: `/Profile/${user.username}` });
+}
+
+async function handlePublicProfile(env, request, usernameParam) {
+    const user = await socialGetUserByUsername(env, usernameParam);
+    if (!user) {
+        return new Response(`<!doctype html><html lang="es"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Perfil no encontrado</title>
+<style>body{margin:0;min-height:100vh;display:grid;place-items:center;background:#06111f;color:#ecf6ff;font-family:system-ui,sans-serif}a{color:#4cc8ff}</style></head>
+<body><div style="text-align:center"><h1>🌊 404</h1><p>No existe el perfil <b>@${escapeHTML(String(usernameParam||''))}</b></p><a href="/">Inicio</a></div></body></html>`, { status: 404, headers: { 'Content-Type': 'text/html; charset=utf-8' } });
+    }
+    const u = await socialEnsureUserMeta(env, user);
+    const pub = socialPublicUser(u);
+    const viewer = await requireAuth(env, request);
+    let relation = 'none';
+    let blocked = false;
+    if (viewer) {
+        const me = await socialEnsureUserMeta(env, viewer.user);
+        if (me.email === u.email) relation = 'self';
+        else {
+            blocked = await socialIsBlockedEither(env, me.email, u.email);
+            const fr = await socialGetFriends(env, me.email);
+            if (fr.accepted.includes(u.email.toLowerCase())) relation = 'friends';
+            else if (fr.outgoing.includes(u.email.toLowerCase())) relation = 'outgoing';
+            else if (fr.incoming.includes(u.email.toLowerCase())) relation = 'incoming';
+        }
+    }
+    const badge = pub.verified ? '<span title="Verificado" style="color:#1da1f2;font-size:22px;vertical-align:middle">✔</span>' : '';
+    const adminBadge = pub.role === 'admin' ? '<span style="background:#ffb020;color:#1a1000;padding:2px 8px;border-radius:999px;font-size:11px;font-weight:700;margin-left:6px">ADMIN</span>' : '';
+    let actions = '';
+    if (relation === 'self') {
+        actions = `<a class="btn" href="/profile">Editar mi perfil</a><a class="btn secondary" href="/messages">Mensajes</a><a class="btn secondary" href="/friends">Amigos</a>`;
+    } else if (viewer && !blocked) {
+        if (relation === 'friends') actions = `<a class="btn" href="/messages/${encodeURIComponent(pub.username)}">💬 Chat privado</a><button class="btn danger" data-act="unfriend">Eliminar amigo</button><button class="btn danger" data-act="block">Bloquear</button>`;
+        else if (relation === 'outgoing') actions = `<button class="btn secondary" disabled>Solicitud enviada</button><button class="btn danger" data-act="cancel">Cancelar solicitud</button>`;
+        else if (relation === 'incoming') actions = `<button class="btn" data-act="accept">Aceptar solicitud</button><button class="btn danger" data-act="reject">Rechazar</button>`;
+        else actions = `<button class="btn" data-act="request">＋ Solicitud de amistad</button><button class="btn danger" data-act="block">Bloquear</button>`;
+    } else if (viewer && blocked) {
+        actions = `<p style="color:#ff8a9a">No puedes interactuar con este usuario.</p><button class="btn" data-act="unblock">Desbloquear</button>`;
+    } else {
+        actions = `<a class="btn" href="/login">Inicia sesión para interactuar</a>`;
+    }
+
+    const html = `<!doctype html>
+<html lang="es"><head>
+<meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>${escapeHTML(pub.name)} (@${escapeHTML(pub.username)}) — Ocean Hub</title>
+<style>
+:root{--bg:#06111f;--card:rgba(9,25,42,.92);--line:rgba(119,190,255,.18);--text:#ecf6ff;--muted:#8ea9c2}
+*{box-sizing:border-box}body{margin:0;min-height:100vh;background:radial-gradient(circle at 50% -10%,rgba(0,160,255,.16),transparent 40%),#06111f;color:var(--text);font-family:Inter,system-ui,sans-serif}
+.wrap{max-width:560px;margin:0 auto;padding:28px 16px 60px}
+.card{background:var(--card);border:1px solid var(--line);border-radius:22px;padding:28px 22px;box-shadow:0 20px 60px rgba(0,0,0,.35)}
+.avatar{width:84px;height:84px;border-radius:24px;background:linear-gradient(145deg,#0bbaff,#0b61ff);display:grid;place-items:center;font-size:40px;margin:0 auto 14px}
+h1{margin:0;font-size:26px;text-align:center}
+.user{text-align:center;color:var(--muted);margin:6px 0 14px;font-size:14px}
+.bio{text-align:center;color:#cfe6f8;font-size:14px;line-height:1.5;margin:0 0 18px}
+.actions{display:flex;flex-wrap:wrap;gap:8px;justify-content:center}
+.btn{appearance:none;border:1px solid rgba(80,180,255,.35);background:linear-gradient(145deg,#0b7dff,#0a4db8);color:#fff;border-radius:12px;padding:10px 14px;font-weight:600;font-size:13px;cursor:pointer;text-decoration:none;display:inline-flex;align-items:center}
+.btn.secondary{background:rgba(8,30,50,.8)}.btn.danger{background:rgba(80,20,40,.85);border-color:rgba(255,100,130,.35)}
+.meta{text-align:center;color:var(--muted);font-size:12px;margin-top:18px}
+a.top{color:#7ecbff;text-decoration:none;font-size:13px}
+</style></head><body>
+<div class="wrap">
+  <p><a class="top" href="/home">← Ocean Hub</a></p>
+  <div class="card">
+    <div class="avatar">${escapeHTML(pub.avatar_emoji)}</div>
+    <h1>${escapeHTML(pub.name)} ${badge}${adminBadge}</h1>
+    <div class="user">@${escapeHTML(pub.username)}</div>
+    <p class="bio">${escapeHTML(pub.bio || 'Sin biografía todavía.')}</p>
+    <div class="actions" id="actions">${actions}</div>
+    <div class="meta">Miembro desde ${escapeHTML(String(pub.created_at||'').slice(0,10) || '—')}</div>
+  </div>
+</div>
+<script>
+(function(){
+  var un=${JSON.stringify(pub.username)};
+  async function api(url, body){
+    var res = await fetch(url,{method:'POST',credentials:'same-origin',headers:{'Content-Type':'application/json'},body:JSON.stringify(body||{})});
+    var data = await res.json().catch(function(){return {}});
+    if(!res.ok) throw new Error(data.error||('HTTP '+res.status));
+    return data;
+  }
+  document.getElementById('actions').addEventListener('click', async function(e){
+    var btn = e.target.closest('[data-act]'); if(!btn) return;
+    var act = btn.dataset.act; btn.disabled = true;
+    try{
+      if(act==='request') await api('/friends/request',{username:un});
+      else if(act==='accept') await api('/friends/accept',{username:un});
+      else if(act==='reject'||act==='cancel') await api('/friends/reject',{username:un});
+      else if(act==='unfriend') await api('/friends/remove',{username:un});
+      else if(act==='block') await api('/block',{username:un});
+      else if(act==='unblock') await api('/unblock',{username:un});
+      location.reload();
+    }catch(err){ alert(err.message||'Error'); btn.disabled=false; }
+  });
+})();
+</script>
+</body></html>`;
+    return new Response(html, { headers: { 'Content-Type': 'text/html; charset=utf-8', 'Cache-Control': 'no-store' } });
+}
+
+async function handleFriendsApi(env, request, action) {
+    const auth = await requireAuth(env, request);
+    if (!auth) return jsonResponse({ error: 'No autorizado' }, 403);
+    const me = await socialEnsureUserMeta(env, auth.user);
+    if (request.method === 'GET' || action === 'list') {
+        const fr = await socialGetFriends(env, me.email);
+        async function mapList(emails) {
+            const out = [];
+            for (const em of (emails || []).slice(0, 100)) {
+                const u = await getUserByEmail(env, em);
+                if (u) out.push(socialPublicUser(await socialEnsureUserMeta(env, u)));
+            }
+            return out;
+        }
+        return jsonResponse({
+            me: socialPublicUser(me),
+            accepted: await mapList(fr.accepted),
+            outgoing: await mapList(fr.outgoing),
+            incoming: await mapList(fr.incoming)
+        });
+    }
+    if (request.method !== 'POST') return jsonResponse({ error: 'Método no permitido' }, 405);
+    let body; try { body = await request.json(); } catch { return jsonResponse({ error: 'JSON inválido' }, 400); }
+    const targetUser = await socialGetUserByUsername(env, body?.username || body?.user || '');
+    if (!targetUser) return jsonResponse({ error: 'Usuario no encontrado' }, 404);
+    const other = await socialEnsureUserMeta(env, targetUser);
+    if (other.email === me.email) return jsonResponse({ error: 'No puedes hacer eso contigo mismo' }, 400);
+    if (await socialIsBlockedEither(env, me.email, other.email)) return jsonResponse({ error: 'Acción bloqueada entre estos usuarios' }, 403);
+
+    const myFr = await socialGetFriends(env, me.email);
+    const otFr = await socialGetFriends(env, other.email);
+    const meE = me.email.toLowerCase();
+    const otE = other.email.toLowerCase();
+
+    if (action === 'request') {
+        if (myFr.accepted.includes(otE)) return jsonResponse({ error: 'Ya sois amigos' }, 400);
+        if (myFr.outgoing.includes(otE)) return jsonResponse({ ok: true, status: 'already_sent' });
+        if (myFr.incoming.includes(otE)) {
+            myFr.incoming = myFr.incoming.filter(x => x !== otE);
+            otFr.outgoing = otFr.outgoing.filter(x => x !== meE);
+            myFr.accepted.push(otE);
+            otFr.accepted.push(meE);
+            await socialSaveFriends(env, me.email, myFr);
+            await socialSaveFriends(env, other.email, otFr);
+            return jsonResponse({ ok: true, status: 'accepted' });
+        }
+        myFr.outgoing.push(otE);
+        otFr.incoming.push(meE);
+        await socialSaveFriends(env, me.email, myFr);
+        await socialSaveFriends(env, other.email, otFr);
+        return jsonResponse({ ok: true, status: 'sent' });
+    }
+    if (action === 'accept') {
+        if (!myFr.incoming.includes(otE)) return jsonResponse({ error: 'No hay solicitud pendiente' }, 400);
+        myFr.incoming = myFr.incoming.filter(x => x !== otE);
+        otFr.outgoing = otFr.outgoing.filter(x => x !== meE);
+        if (!myFr.accepted.includes(otE)) myFr.accepted.push(otE);
+        if (!otFr.accepted.includes(meE)) otFr.accepted.push(meE);
+        await socialSaveFriends(env, me.email, myFr);
+        await socialSaveFriends(env, other.email, otFr);
+        return jsonResponse({ ok: true, status: 'accepted' });
+    }
+    if (action === 'reject' || action === 'cancel') {
+        myFr.incoming = myFr.incoming.filter(x => x !== otE);
+        myFr.outgoing = myFr.outgoing.filter(x => x !== otE);
+        otFr.incoming = otFr.incoming.filter(x => x !== meE);
+        otFr.outgoing = otFr.outgoing.filter(x => x !== meE);
+        await socialSaveFriends(env, me.email, myFr);
+        await socialSaveFriends(env, other.email, otFr);
+        return jsonResponse({ ok: true, status: 'cleared' });
+    }
+    if (action === 'remove') {
+        myFr.accepted = myFr.accepted.filter(x => x !== otE);
+        otFr.accepted = otFr.accepted.filter(x => x !== meE);
+        await socialSaveFriends(env, me.email, myFr);
+        await socialSaveFriends(env, other.email, otFr);
+        return jsonResponse({ ok: true, status: 'removed' });
+    }
+    return jsonResponse({ error: 'Acción desconocida' }, 400);
+}
+
+async function handleBlockApi(env, request, action) {
+    const auth = await requireAuth(env, request);
+    if (!auth) return jsonResponse({ error: 'No autorizado' }, 403);
+    const me = await socialEnsureUserMeta(env, auth.user);
+    if (request.method === 'GET' || action === 'list') {
+        const blocks = await socialGetBlocks(env, me.email);
+        const out = [];
+        for (const em of blocks.slice(0, 100)) {
+            const u = await getUserByEmail(env, em);
+            if (u) out.push(socialPublicUser(await socialEnsureUserMeta(env, u)));
+        }
+        return jsonResponse({ blocks: out });
+    }
+    if (request.method !== 'POST') return jsonResponse({ error: 'Método no permitido' }, 405);
+    let body; try { body = await request.json(); } catch { return jsonResponse({ error: 'JSON inválido' }, 400); }
+    const targetUser = await socialGetUserByUsername(env, body?.username || '');
+    if (!targetUser) return jsonResponse({ error: 'Usuario no encontrado' }, 404);
+    const other = await socialEnsureUserMeta(env, targetUser);
+    if (other.email === me.email) return jsonResponse({ error: 'No puedes bloquearte a ti mismo' }, 400);
+    let blocks = await socialGetBlocks(env, me.email);
+    const otE = other.email.toLowerCase();
+    if (action === 'block') {
+        if (!blocks.includes(otE)) blocks.push(otE);
+        const myFr = await socialGetFriends(env, me.email);
+        const otFr = await socialGetFriends(env, other.email);
+        myFr.accepted = myFr.accepted.filter(x => x !== otE);
+        myFr.outgoing = myFr.outgoing.filter(x => x !== otE);
+        myFr.incoming = myFr.incoming.filter(x => x !== otE);
+        otFr.accepted = otFr.accepted.filter(x => x !== me.email.toLowerCase());
+        otFr.outgoing = otFr.outgoing.filter(x => x !== me.email.toLowerCase());
+        otFr.incoming = otFr.incoming.filter(x => x !== me.email.toLowerCase());
+        await socialSaveFriends(env, me.email, myFr);
+        await socialSaveFriends(env, other.email, otFr);
+        await socialSaveBlocks(env, me.email, blocks);
+        return jsonResponse({ ok: true, blocked: true });
+    }
+    if (action === 'unblock') {
+        blocks = blocks.filter(x => x !== otE);
+        await socialSaveBlocks(env, me.email, blocks);
+        return jsonResponse({ ok: true, blocked: false });
+    }
+    return jsonResponse({ error: 'Acción desconocida' }, 400);
+}
+
+async function handleMessagesApi(env, request, peerUsername) {
+    const auth = await requireAuth(env, request);
+    if (!auth) return jsonResponse({ error: 'No autorizado' }, 403);
+    const me = await socialEnsureUserMeta(env, auth.user);
+
+    if (!peerUsername) {
+        const inbox = await env.STATS.get(`dm_inbox_${me.email.toLowerCase()}`, 'json') || [];
+        const threads = [];
+        for (const item of inbox.slice(0, SOCIAL_MAX_DM_THREADS)) {
+            const u = await getUserByEmail(env, item.peer);
+            if (!u) continue;
+            const pub = socialPublicUser(await socialEnsureUserMeta(env, u));
+            threads.push({ user: pub, last: item.last, at: item.at });
+        }
+        return jsonResponse({ threads });
+    }
+
+    const other = await socialGetUserByUsername(env, peerUsername);
+    if (!other) return jsonResponse({ error: 'Usuario no encontrado' }, 404);
+    const peer = await socialEnsureUserMeta(env, other);
+    if (peer.email === me.email) return jsonResponse({ error: 'No puedes chatear contigo mismo' }, 400);
+    if (await socialIsBlockedEither(env, me.email, peer.email)) return jsonResponse({ error: 'No puedes mensajear a este usuario' }, 403);
+    if (!(await socialAreFriends(env, me.email, peer.email))) return jsonResponse({ error: 'Solo puedes chatear con amigos. Envía una solicitud primero.' }, 403);
+
+    if (request.method === 'GET') {
+        const thread = await socialGetDmThread(env, me.email, peer.email);
+        return jsonResponse({
+            peer: socialPublicUser(peer),
+            messages: (thread.messages || []).map(m => ({
+                id: m.id, from: m.from === me.email.toLowerCase() ? 'me' : 'them',
+                text: m.text, at: m.at
+            }))
+        });
+    }
+    if (request.method !== 'POST') return jsonResponse({ error: 'Método no permitido' }, 405);
+    let body; try { body = await request.json(); } catch { return jsonResponse({ error: 'JSON inválido' }, 400); }
+    const text = String(body?.text || body?.message || '').trim().slice(0, SOCIAL_DM_MAX_LEN);
+    if (!text) return jsonResponse({ error: 'Mensaje vacío' }, 400);
+    const thread = await socialGetDmThread(env, me.email, peer.email);
+    const msg = { id: crypto.randomUUID(), from: me.email.toLowerCase(), text, at: new Date().toISOString() };
+    thread.messages = [...(thread.messages || []), msg];
+    await socialSaveDmThread(env, me.email, peer.email, thread);
+    await socialTouchInbox(env, me.email, peer.email, text);
+    await socialTouchInbox(env, peer.email, me.email, text);
+    return jsonResponse({ ok: true, message: { id: msg.id, from: 'me', text: msg.text, at: msg.at } });
+}
+
+function socialShell(title, bodyHtml, extraScript = '') {
+    return `<!doctype html><html lang="es"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>${title} — Ocean Hub</title>
+<style>
+:root{--bg:#06111f;--card:rgba(9,25,42,.92);--line:rgba(119,190,255,.18);--text:#ecf6ff;--muted:#8ea9c2}
+*{box-sizing:border-box}body{margin:0;background:radial-gradient(circle at 40% 0,rgba(0,150,255,.12),transparent 35%),#06111f;color:var(--text);font-family:Inter,system-ui,sans-serif;min-height:100vh}
+.wrap{max-width:720px;margin:0 auto;padding:20px 14px 50px}h1{font-size:22px;margin:0 0 14px}
+.card{background:var(--card);border:1px solid var(--line);border-radius:16px;padding:14px;margin-bottom:10px}
+.row{display:flex;align-items:center;gap:10px;justify-content:space-between;flex-wrap:wrap}
+.user{display:flex;align-items:center;gap:10px}.av{width:40px;height:40px;border-radius:12px;background:linear-gradient(145deg,#0bbaff,#0b61ff);display:grid;place-items:center}
+.muted{color:var(--muted);font-size:12px}a{color:#7ecbff}
+.btn{border:1px solid rgba(80,180,255,.35);background:#0b6fd6;color:#fff;border-radius:10px;padding:8px 12px;font-size:12px;cursor:pointer;text-decoration:none}
+.btn.danger{background:#5a2030}.btn.ghost{background:transparent}
+input,textarea{width:100%;background:#081828;border:1px solid var(--line);color:var(--text);border-radius:12px;padding:10px 12px;font:inherit}
+.nav{display:flex;gap:10px;flex-wrap:wrap;margin-bottom:16px;font-size:13px}
+.msgs{display:flex;flex-direction:column;gap:8px;max-height:55vh;overflow:auto;padding:8px 0}
+.bubble{max-width:80%;padding:10px 12px;border-radius:14px;font-size:14px;line-height:1.4}
+.me{align-self:flex-end;background:#0b5fad}.them{align-self:flex-start;background:#13283f}
+.composer{display:flex;gap:8px;margin-top:10px}
+</style></head><body><div class="wrap">
+<div class="nav"><a href="/home">Inicio</a><a href="/friends">Amigos</a><a href="/messages">Mensajes</a><a href="/profile">Mi perfil</a></div>
+${bodyHtml}
+</div><script>${extraScript}</script></body></html>`;
+}
+
+async function handleFriendsPage(env, request) {
+    const auth = await requireAuth(env, request);
+    if (!auth) return Response.redirect(new URL('/login', request.url).href, 302);
+    const me = await socialEnsureUserMeta(env, auth.user);
+    const html = socialShell('Amigos', `
+      <h1>👥 Amigos</h1>
+      <div class="card"><form id="addForm" class="row"><input id="userInput" placeholder="Nombre de usuario (ej: YoelZorrilla)" required style="flex:1;min-width:180px"><button class="btn" type="submit">Enviar solicitud</button></form>
+      <p class="muted" style="margin:8px 0 0">Tu perfil público: <a href="/Profile/${encodeURIComponent(me.username)}">/Profile/${escapeHTML(me.username)}</a></p></div>
+      <h2 style="font-size:15px;color:#9ec9e8">Solicitudes recibidas</h2><div id="incoming"></div>
+      <h2 style="font-size:15px;color:#9ec9e8">Amigos</h2><div id="accepted"></div>
+      <h2 style="font-size:15px;color:#9ec9e8">Enviadas</h2><div id="outgoing"></div>
+      <h2 style="font-size:15px;color:#9ec9e8">Bloqueados</h2><div id="blocked"></div>
+    `, `
+    async function api(url,opts){var r=await fetch(url,Object.assign({credentials:'same-origin'},opts||{}));var d=await r.json().catch(function(){return{}});if(!r.ok)throw new Error(d.error||r.status);return d;}
+    function card(u,actions){return '<div class="card row"><div class="user"><div class="av">'+(u.avatar_emoji||'👤')+'</div><div><b>'+u.name+(u.verified?' <span style="color:#1da1f2">✔</span>':'')+'</b><div class="muted"><a href="/Profile/'+encodeURIComponent(u.username)+'">@'+u.username+'</a></div></div></div><div>'+actions+'</div></div>';}
+    async function load(){
+      var d=await api('/api/friends');
+      var b=await api('/blocks');
+      document.getElementById('incoming').innerHTML=(d.incoming||[]).map(function(u){return card(u,'<button class="btn" data-a="accept" data-u="'+u.username+'">Aceptar</button> <button class="btn danger" data-a="reject" data-u="'+u.username+'">Rechazar</button>');}).join('')||'<p class="muted">Nada pendiente</p>';
+      document.getElementById('accepted').innerHTML=(d.accepted||[]).map(function(u){return card(u,'<a class="btn" href="/messages/'+encodeURIComponent(u.username)+'">Chat</a> <button class="btn danger" data-a="remove" data-u="'+u.username+'">Eliminar</button> <button class="btn danger" data-a="block" data-u="'+u.username+'">Bloquear</button>');}).join('')||'<p class="muted">Aún no tienes amigos</p>';
+      document.getElementById('outgoing').innerHTML=(d.outgoing||[]).map(function(u){return card(u,'<button class="btn danger" data-a="cancel" data-u="'+u.username+'">Cancelar</button>');}).join('')||'<p class="muted">Sin solicitudes enviadas</p>';
+      document.getElementById('blocked').innerHTML=(b.blocks||[]).map(function(u){return card(u,'<button class="btn" data-a="unblock" data-u="'+u.username+'">Desbloquear</button>');}).join('')||'<p class="muted">Nadie bloqueado</p>';
+    }
+    document.getElementById('addForm').onsubmit=async function(e){e.preventDefault();try{await api('/friends/request',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({username:document.getElementById('userInput').value.trim()})});document.getElementById('userInput').value='';await load();}catch(err){alert(err.message)}};
+    document.body.addEventListener('click',async function(e){var btn=e.target.closest('[data-a]');if(!btn)return;var a=btn.dataset.a,u=btn.dataset.u;try{
+      if(a==='accept')await api('/friends/accept',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({username:u})});
+      else if(a==='reject'||a==='cancel')await api('/friends/reject',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({username:u})});
+      else if(a==='remove')await api('/friends/remove',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({username:u})});
+      else if(a==='block')await api('/block',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({username:u})});
+      else if(a==='unblock')await api('/unblock',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({username:u})});
+      await load();
+    }catch(err){alert(err.message)}});
+    load().catch(function(e){document.getElementById('accepted').innerHTML='<p class="muted">Error: '+e.message+'</p>'});
+    `);
+    return new Response(html, { headers: { 'Content-Type': 'text/html; charset=utf-8', 'Cache-Control': 'no-store' } });
+}
+
+async function handleMessagesPage(env, request, peerUsername) {
+    const auth = await requireAuth(env, request);
+    if (!auth) return Response.redirect(new URL('/login', request.url).href, 302);
+    await socialEnsureUserMeta(env, auth.user);
+    if (!peerUsername) {
+        const html = socialShell('Mensajes', `
+          <h1>💬 Mensajes privados</h1>
+          <p class="muted">Solo puedes chatear con amigos. <a href="/friends">Gestionar amigos</a></p>
+          <div id="list"><p class="muted">Cargando…</p></div>
+        `, `
+        async function api(url){var r=await fetch(url,{credentials:'same-origin'});var d=await r.json().catch(function(){return{}});if(!r.ok)throw new Error(d.error||r.status);return d;}
+        api('/messages/api').then(function(d){
+          var list=d.threads||[];
+          document.getElementById('list').innerHTML=list.length?list.map(function(t){return '<a class="card row" href="/messages/'+encodeURIComponent(t.user.username)+'" style="text-decoration:none;color:inherit"><div class="user"><div class="av">'+(t.user.avatar_emoji||'👤')+'</div><div><b>'+t.user.name+(t.user.verified?' <span style="color:#1da1f2">✔</span>':'')+'</b><div class="muted">'+((t.last)||'')+'</div></div></div><div class="muted">'+(t.at||'').slice(11,16)+'</div></a>';}).join(''):'<p class="muted">No hay conversaciones todavía</p>';
+        }).catch(function(e){document.getElementById('list').innerHTML='<p class="muted">'+e.message+'</p>'});
+        `);
+        return new Response(html, { headers: { 'Content-Type': 'text/html; charset=utf-8', 'Cache-Control': 'no-store' } });
+    }
+    const peer = await socialGetUserByUsername(env, peerUsername);
+    if (!peer) return new Response('Usuario no encontrado', { status: 404 });
+    const pub = socialPublicUser(await socialEnsureUserMeta(env, peer));
+    const html = socialShell('Chat con ' + pub.name, `
+      <h1>💬 ${escapeHTML(pub.name)} ${pub.verified ? '<span style="color:#1da1f2">✔</span>' : ''} <span class="muted">@${escapeHTML(pub.username)}</span></h1>
+      <p class="muted"><a href="/Profile/${encodeURIComponent(pub.username)}">Ver perfil</a></p>
+      <div class="card"><div class="msgs" id="msgs"></div>
+      <form class="composer" id="form"><input id="text" maxlength="2000" placeholder="Escribe un mensaje…" autocomplete="off" required><button class="btn" type="submit">Enviar</button></form></div>
+    `, `
+    var un=${JSON.stringify(pub.username)};
+    async function api(url,opts){var r=await fetch(url,Object.assign({credentials:'same-origin'},opts||{}));var d=await r.json().catch(function(){return{}});if(!r.ok)throw new Error(d.error||r.status);return d;}
+    function render(msgs){var el=document.getElementById('msgs');el.innerHTML=(msgs||[]).map(function(m){return '<div class="bubble '+(m.from==='me'?'me':'them')+'">'+m.text.replace(/</g,'&lt;')+'<div class="muted" style="font-size:10px;margin-top:4px">'+(m.at||'').slice(11,16)+'</div></div>';}).join('');el.scrollTop=el.scrollHeight;}
+    async function load(){var d=await api('/messages/api/'+encodeURIComponent(un));render(d.messages);}
+    document.getElementById('form').onsubmit=async function(e){e.preventDefault();var t=document.getElementById('text');var v=t.value.trim();if(!v)return;t.value='';try{await api('/messages/api/'+encodeURIComponent(un),{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({text:v})});await load();}catch(err){alert(err.message)}};
+    load().catch(function(e){document.getElementById('msgs').innerHTML='<p class="muted">'+e.message+'</p>'});
+    setInterval(function(){load().catch(function(){})},8000);
+    `);
+    return new Response(html, { headers: { 'Content-Type': 'text/html; charset=utf-8', 'Cache-Control': 'no-store' } });
+}
+
+async function handleAdminSocialPage(env, request) {
+    const auth = await requireAdmin(env, request);
+    if (!auth) return jsonResponse({ error: 'No autorizado' }, 403);
+    const html = socialShell('Admin · Verificación', `
+      <h1>✔ Verificar usuarios</h1>
+      <div class="card">
+        <p class="muted">Otorga o quita la insignia de verificación permanente por username o email.</p>
+        <form id="f" class="row" style="flex-direction:column;align-items:stretch">
+          <input id="target" placeholder="Username o email" required>
+          <div style="display:flex;gap:8px">
+            <button class="btn" type="submit">Verificar ✔</button>
+            <button class="btn danger" type="button" id="unverify">Quitar verificación</button>
+          </div>
+        </form>
+        <pre id="out" class="muted" style="margin-top:12px;white-space:pre-wrap"></pre>
+      </div>
+    `, `
+    async function go(verified){
+      var target=document.getElementById('target').value.trim();
+      var r=await fetch('/admin/verify-user',{method:'POST',credentials:'same-origin',headers:{'Content-Type':'application/json'},body:JSON.stringify({username:target,email:target,verified:verified})});
+      var d=await r.json().catch(function(){return{}});
+      document.getElementById('out').textContent=JSON.stringify(d,null,2);
+    }
+    document.getElementById('f').onsubmit=function(e){e.preventDefault();go(true)};
+    document.getElementById('unverify').onclick=function(){go(false)};
+    `);
+    return new Response(html, { headers: { 'Content-Type': 'text/html; charset=utf-8', 'Cache-Control': 'no-store' } });
+}
+
 
 export { KVLocker };
 
@@ -7497,6 +8061,33 @@ export async function workerFetch(request, env) {
         if (path === '/leaderboard') return await handleLeaderboard(env);
         if (path === '/toggle-dark-mode') return await handleToggleDarkMode(env, request);
         if (path === '/cron-jobs') return await handleCronJobs(env);
+
+        // --- Social ---
+        if (path.startsWith('/Profile/') || path.startsWith('/profile/') || path.startsWith('/u/')) {
+            const uname = decodeURIComponent(path.split('/').filter(Boolean)[1] || '');
+            return await handlePublicProfile(env, request, uname);
+        }
+        if (path === '/api/friends') return await handleFriendsApi(env, request, 'list');
+        if (path === '/friends/request') return await handleFriendsApi(env, request, 'request');
+        if (path === '/friends/accept') return await handleFriendsApi(env, request, 'accept');
+        if (path === '/friends/reject') return await handleFriendsApi(env, request, 'reject');
+        if (path === '/friends/remove') return await handleFriendsApi(env, request, 'remove');
+        if (path === '/friends') return await handleFriendsPage(env, request);
+        if (path === '/block') return await handleBlockApi(env, request, 'block');
+        if (path === '/unblock') return await handleBlockApi(env, request, 'unblock');
+        if (path === '/blocks') return await handleBlockApi(env, request, 'list');
+        if (path === '/messages/api') return await handleMessagesApi(env, request, null);
+        if (path.startsWith('/messages/api/')) {
+            const uname = decodeURIComponent(path.slice('/messages/api/'.length).split('/')[0] || '');
+            return await handleMessagesApi(env, request, uname);
+        }
+        if (path === '/messages') return await handleMessagesPage(env, request, null);
+        if (path.startsWith('/messages/')) {
+            const uname = decodeURIComponent(path.slice('/messages/'.length).split('/')[0] || '');
+            if (uname) return await handleMessagesPage(env, request, uname);
+        }
+        if (path === '/admin/verify-user') return await handleAdminVerifyUser(env, request);
+        if (path === '/admin/social' || path === '/admin/verificacion') return await handleAdminSocialPage(env, request);
 
         return new Response('🌊 404 - Ruta no encontrada', { status: 404 });
 }
