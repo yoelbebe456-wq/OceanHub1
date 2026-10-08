@@ -1,5 +1,5 @@
 // ==================================================
-// 🌊 OCEAN HUB V29.0 — SOCIAL: perfiles /Profile/user, verificación, amigos, bloqueo, DM
+// 🌊 OCEAN HUB V29.1 — SOCIAL + editar perfil (bio/avatar) + notificaciones
 // Añadido: recuperación de contraseña por email, aviso de compra,
 // historial de inicios de sesión, páginas legales y banner de cookies.
 // FIX: BASE_URL, SENDER_EMAIL y SENDER_NAME ahora desde env.
@@ -7464,7 +7464,7 @@ async function handlePublicProfile(env, request, usernameParam) {
     const adminBadge = pub.role === 'admin' ? '<span style="background:#ffb020;color:#1a1000;padding:2px 8px;border-radius:999px;font-size:11px;font-weight:700;margin-left:6px">ADMIN</span>' : '';
     let actions = '';
     if (relation === 'self') {
-        actions = `<a class="btn" href="/profile">Editar mi perfil</a><a class="btn secondary" href="/messages">Mensajes</a><a class="btn secondary" href="/friends">Amigos</a>`;
+        actions = `<a class="btn" href="/profile/edit">Editar mi perfil</a><a class="btn secondary" href="/messages">Mensajes</a><a class="btn secondary" href="/friends">Amigos</a>`;
     } else if (viewer && !blocked) {
         if (relation === 'friends') actions = `<a class="btn" href="/messages/${encodeURIComponent(pub.username)}">💬 Chat privado</a><button class="btn danger" data-act="unfriend">Eliminar amigo</button><button class="btn danger" data-act="block">Bloquear</button>`;
         else if (relation === 'outgoing') actions = `<button class="btn secondary" disabled>Solicitud enviada</button><button class="btn danger" data-act="cancel">Cancelar solicitud</button>`;
@@ -7584,6 +7584,15 @@ async function handleFriendsApi(env, request, action) {
         otFr.incoming.push(meE);
         await socialSaveFriends(env, me.email, myFr);
         await socialSaveFriends(env, other.email, otFr);
+        try {
+            await socialPushNotif(env, other.email, {
+                type: 'friend_request',
+                title: 'Nueva solicitud de amistad',
+                body: `@${me.username} quiere ser tu amigo`,
+                from_username: me.username,
+                href: '/friends'
+            });
+        } catch (_) {}
         return jsonResponse({ ok: true, status: 'sent' });
     }
     if (action === 'accept') {
@@ -7594,6 +7603,15 @@ async function handleFriendsApi(env, request, action) {
         if (!otFr.accepted.includes(meE)) otFr.accepted.push(meE);
         await socialSaveFriends(env, me.email, myFr);
         await socialSaveFriends(env, other.email, otFr);
+        try {
+            await socialPushNotif(env, other.email, {
+                type: 'friend_accept',
+                title: 'Solicitud aceptada',
+                body: `@${me.username} aceptó tu solicitud de amistad`,
+                from_username: me.username,
+                href: `/messages/${encodeURIComponent(me.username)}`
+            });
+        } catch (_) {}
         return jsonResponse({ ok: true, status: 'accepted' });
     }
     if (action === 'reject' || action === 'cancel') {
@@ -7703,6 +7721,15 @@ async function handleMessagesApi(env, request, peerUsername) {
     await socialSaveDmThread(env, me.email, peer.email, thread);
     await socialTouchInbox(env, me.email, peer.email, text);
     await socialTouchInbox(env, peer.email, me.email, text);
+    try {
+        await socialPushNotif(env, peer.email, {
+            type: 'dm',
+            title: `Mensaje de @${me.username}`,
+            body: text.slice(0, 100),
+            from_username: me.username,
+            href: `/messages/${encodeURIComponent(me.username)}`
+        });
+    } catch (_) {}
     return jsonResponse({ ok: true, message: { id: msg.id, from: 'me', text: msg.text, at: msg.at } });
 }
 
@@ -7726,7 +7753,7 @@ input,textarea{width:100%;background:#081828;border:1px solid var(--line);color:
 .me{align-self:flex-end;background:#0b5fad}.them{align-self:flex-start;background:#13283f}
 .composer{display:flex;gap:8px;margin-top:10px}
 </style></head><body><div class="wrap">
-<div class="nav"><a href="/home">Inicio</a><a href="/friends">Amigos</a><a href="/messages">Mensajes</a><a href="/profile">Mi perfil</a></div>
+<div class="nav"><a href="/home">Inicio</a><a href="/friends">Amigos</a><a href="/messages">Mensajes</a><a href="/notifications">Notificaciones</a><a href="/profile/edit">Editar perfil</a><a href="/profile">Mi perfil</a></div>
 ${bodyHtml}
 </div><script>${extraScript}</script></body></html>`;
 }
@@ -7831,6 +7858,202 @@ async function handleAdminSocialPage(env, request) {
     }
     document.getElementById('f').onsubmit=function(e){e.preventDefault();go(true)};
     document.getElementById('unverify').onclick=function(){go(false)};
+    `);
+    return new Response(html, { headers: { 'Content-Type': 'text/html; charset=utf-8', 'Cache-Control': 'no-store' } });
+}
+
+
+
+// ==================================================
+// [ 👤 EDITAR PERFIL + 🔔 NOTIFICACIONES ]
+// ==================================================
+
+const SOCIAL_MAX_NOTIFS = 50;
+
+async function socialGetNotifs(env, email) {
+    return await env.STATS.get(`notifs_${String(email).toLowerCase()}`, 'json') || [];
+}
+
+async function socialSaveNotifs(env, email, list) {
+    const clean = (Array.isArray(list) ? list : []).slice(0, SOCIAL_MAX_NOTIFS);
+    await env.STATS.put(`notifs_${String(email).toLowerCase()}`, JSON.stringify(clean));
+    return clean;
+}
+
+async function socialPushNotif(env, toEmail, notif) {
+    const list = await socialGetNotifs(env, toEmail);
+    const item = {
+        id: crypto.randomUUID(),
+        type: String(notif.type || 'info').slice(0, 40),
+        title: String(notif.title || '').slice(0, 120),
+        body: String(notif.body || '').slice(0, 280),
+        from_username: notif.from_username ? String(notif.from_username).slice(0, 40) : null,
+        href: notif.href ? String(notif.href).slice(0, 200) : null,
+        read: false,
+        at: new Date().toISOString()
+    };
+    list.unshift(item);
+    await socialSaveNotifs(env, toEmail, list);
+    return item;
+}
+
+async function handleEditProfileApi(env, request) {
+    const auth = await requireAuth(env, request);
+    if (!auth) return jsonResponse({ error: 'No autorizado' }, 403);
+    let user = await socialEnsureUserMeta(env, auth.user);
+    if (request.method === 'GET') {
+        return jsonResponse({
+            username: user.username,
+            name: user.name,
+            bio: user.bio || '',
+            avatar_emoji: user.avatar_emoji || '👤',
+            verified: !!user.verified,
+            profile: `/Profile/${user.username}`
+        });
+    }
+    if (request.method !== 'POST') return jsonResponse({ error: 'Método no permitido' }, 405);
+    let body; try { body = await request.json(); } catch { return jsonResponse({ error: 'JSON inválido' }, 400); }
+
+    if (body.name !== undefined) {
+        const name = String(body.name || '').trim().slice(0, 80);
+        if (name.length < 2) return jsonResponse({ error: 'El nombre debe tener al menos 2 caracteres' }, 400);
+        user.name = name;
+    }
+    if (body.bio !== undefined) {
+        user.bio = String(body.bio || '').trim().slice(0, 280);
+    }
+    if (body.avatar_emoji !== undefined) {
+        let emoji = String(body.avatar_emoji || '👤').trim().slice(0, 8);
+        if (!emoji) emoji = '👤';
+        user.avatar_emoji = emoji;
+    }
+    // Cambio de username (opcional, único)
+    if (body.username !== undefined) {
+        const wanted = socialSlugify(body.username);
+        if (wanted.length < 3) return jsonResponse({ error: 'Username mínimo 3 caracteres' }, 400);
+        if (wanted.toLowerCase() !== String(user.username || '').toLowerCase()) {
+            const taken = await env.STATS.get(`username_${wanted.toLowerCase()}`);
+            if (taken && taken !== user.email) return jsonResponse({ error: 'Ese username ya está en uso' }, 409);
+            // liberar viejo
+            if (user.username) await env.STATS.delete(`username_${String(user.username).toLowerCase()}`);
+            user.username = wanted;
+            await env.STATS.put(`username_${wanted.toLowerCase()}`, user.email);
+        }
+    }
+    await socialSaveUser(env, user);
+    return jsonResponse({
+        ok: true,
+        username: user.username,
+        name: user.name,
+        bio: user.bio || '',
+        avatar_emoji: user.avatar_emoji || '👤',
+        verified: !!user.verified,
+        profile: `/Profile/${user.username}`
+    });
+}
+
+async function handleEditProfilePage(env, request) {
+    const auth = await requireAuth(env, request);
+    if (!auth) return Response.redirect(new URL('/login', request.url).href, 302);
+    const user = await socialEnsureUserMeta(env, auth.user);
+    const pub = socialPublicUser(user);
+    const html = socialShell('Editar perfil', `
+      <h1>✏️ Editar perfil</h1>
+      <div class="card">
+        <p class="muted">Tu link público: <a href="/Profile/${encodeURIComponent(pub.username)}">/Profile/${escapeHTML(pub.username)}</a>
+        ${pub.verified ? ' <span style="color:#1da1f2">✔ verificado</span>' : ''}</p>
+        <form id="editForm" style="display:flex;flex-direction:column;gap:10px">
+          <label class="muted">Nombre visible</label>
+          <input id="name" value="${escapeHTML(pub.name)}" maxlength="80" required>
+          <label class="muted">Username (URL del perfil)</label>
+          <input id="username" value="${escapeHTML(pub.username)}" maxlength="24" required pattern="[A-Za-z][A-Za-z0-9_]{2,23}">
+          <label class="muted">Bio (máx. 280)</label>
+          <textarea id="bio" rows="3" maxlength="280">${escapeHTML(pub.bio || '')}</textarea>
+          <label class="muted">Avatar (emoji)</label>
+          <div style="display:flex;gap:8px;flex-wrap:wrap;align-items:center">
+            <input id="avatar" value="${escapeHTML(pub.avatar_emoji)}" maxlength="8" style="width:80px;text-align:center;font-size:22px">
+            <button type="button" class="btn ghost" data-e="👤">👤</button>
+            <button type="button" class="btn ghost" data-e="🌊">🌊</button>
+            <button type="button" class="btn ghost" data-e="👑">👑</button>
+            <button type="button" class="btn ghost" data-e="🦈">🦈</button>
+            <button type="button" class="btn ghost" data-e="⭐">⭐</button>
+            <button type="button" class="btn ghost" data-e="🔥">🔥</button>
+            <button type="button" class="btn ghost" data-e="💎">💎</button>
+            <button type="button" class="btn ghost" data-e="🎮">🎮</button>
+          </div>
+          <button class="btn" type="submit">Guardar cambios</button>
+        </form>
+        <pre id="out" class="muted" style="margin-top:10px;white-space:pre-wrap"></pre>
+      </div>
+    `, `
+    document.querySelectorAll('[data-e]').forEach(function(b){b.onclick=function(){document.getElementById('avatar').value=b.dataset.e}});
+    document.getElementById('editForm').onsubmit=async function(e){
+      e.preventDefault();
+      var body={name:document.getElementById('name').value.trim(),username:document.getElementById('username').value.trim(),bio:document.getElementById('bio').value,avatar_emoji:document.getElementById('avatar').value.trim()};
+      try{
+        var r=await fetch('/profile/edit',{method:'POST',credentials:'same-origin',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)});
+        var d=await r.json().catch(function(){return{}});
+        if(!r.ok)throw new Error(d.error||('HTTP '+r.status));
+        document.getElementById('out').textContent='✅ Guardado. Perfil: '+d.profile;
+        setTimeout(function(){location.href=d.profile},800);
+      }catch(err){document.getElementById('out').textContent='⚠️ '+(err.message||'Error')}
+    };
+    `);
+    return new Response(html, { headers: { 'Content-Type': 'text/html; charset=utf-8', 'Cache-Control': 'no-store' } });
+}
+
+async function handleNotificationsApi(env, request) {
+    const auth = await requireAuth(env, request);
+    if (!auth) return jsonResponse({ error: 'No autorizado' }, 403);
+    const email = auth.user.email;
+    if (request.method === 'GET') {
+        const list = await socialGetNotifs(env, email);
+        const unread = list.filter(x => !x.read).length;
+        return jsonResponse({ notifications: list, unread });
+    }
+    if (request.method !== 'POST') return jsonResponse({ error: 'Método no permitido' }, 405);
+    let body; try { body = await request.json(); } catch { return jsonResponse({ error: 'JSON inválido' }, 400); }
+    let list = await socialGetNotifs(env, email);
+    if (body.action === 'read_all') {
+        list = list.map(x => ({ ...x, read: true }));
+        await socialSaveNotifs(env, email, list);
+        return jsonResponse({ ok: true, unread: 0, notifications: list });
+    }
+    if (body.action === 'read' && body.id) {
+        list = list.map(x => String(x.id) === String(body.id) ? { ...x, read: true } : x);
+        await socialSaveNotifs(env, email, list);
+        return jsonResponse({ ok: true, unread: list.filter(x => !x.read).length, notifications: list });
+    }
+    if (body.action === 'clear') {
+        await socialSaveNotifs(env, email, []);
+        return jsonResponse({ ok: true, unread: 0, notifications: [] });
+    }
+    return jsonResponse({ error: 'Acción desconocida' }, 400);
+}
+
+async function handleNotificationsPage(env, request) {
+    const auth = await requireAuth(env, request);
+    if (!auth) return Response.redirect(new URL('/login', request.url).href, 302);
+    const html = socialShell('Notificaciones', `
+      <h1>🔔 Notificaciones</h1>
+      <div class="row" style="margin-bottom:12px">
+        <button class="btn ghost" id="readAll">Marcar todas leídas</button>
+        <button class="btn danger" id="clearAll">Vaciar</button>
+      </div>
+      <div id="list"><p class="muted">Cargando…</p></div>
+    `, `
+    async function api(url,opts){var r=await fetch(url,Object.assign({credentials:'same-origin'},opts||{}));var d=await r.json().catch(function(){return{}});if(!r.ok)throw new Error(d.error||r.status);return d;}
+    function render(d){
+      var list=d.notifications||[];
+      document.getElementById('list').innerHTML=list.length?list.map(function(n){
+        var href=n.href||'#';
+        return '<a class="card row" href="'+href+'" style="text-decoration:none;color:inherit;opacity:'+(n.read?'.65':'1')+'"><div><b>'+(n.title||'Aviso')+'</b>'+(n.read?'':' <span style="color:#1da1f2">●</span>')+'<div class="muted">'+(n.body||'')+'</div><div class="muted">'+(n.at||'').replace('T',' ').slice(0,16)+'</div></div></a>';
+      }).join(''):'<p class="muted">No tienes notificaciones</p>';
+    }
+    async function load(){render(await api('/api/notifications'))}
+    document.getElementById('readAll').onclick=async function(){await api('/api/notifications',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({action:'read_all'})});await load()};
+    document.getElementById('clearAll').onclick=async function(){if(!confirm('¿Vaciar notificaciones?'))return;await api('/api/notifications',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({action:'clear'})});await load()};
+    load().catch(function(e){document.getElementById('list').innerHTML='<p class="muted">'+e.message+'</p>'});
     `);
     return new Response(html, { headers: { 'Content-Type': 'text/html; charset=utf-8', 'Cache-Control': 'no-store' } });
 }
@@ -8088,6 +8311,16 @@ export async function workerFetch(request, env) {
         }
         if (path === '/admin/verify-user') return await handleAdminVerifyUser(env, request);
         if (path === '/admin/social' || path === '/admin/verificacion') return await handleAdminSocialPage(env, request);
+
+        // --- Perfil editable + notificaciones ---
+        if (path === '/profile/edit') {
+            if (request.method === 'GET' && (request.headers.get('Accept') || '').includes('text/html')) {
+                return await handleEditProfilePage(env, request);
+            }
+            return await handleEditProfileApi(env, request);
+        }
+        if (path === '/api/notifications') return await handleNotificationsApi(env, request);
+        if (path === '/notifications') return await handleNotificationsPage(env, request);
 
         return new Response('🌊 404 - Ruta no encontrada', { status: 404 });
 }
