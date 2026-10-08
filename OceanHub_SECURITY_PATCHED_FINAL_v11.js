@@ -19,7 +19,8 @@ const BLACKLIST_THRESHOLD = 10;
 const BLACKLIST_BAN_TIME = 3600;
 const IP_REPUTATION_WINDOW = 600;
 const OTP_TTL = 300;
-const SESSION_TTL = 604800;
+const SESSION_TTL = 2592000; // 30 días; la sesión queda persistida en KV y en la cookie segura.
+const OAUTH_STATE_TTL = 600; // 10 minutos, un solo uso.
 const SALT_ROUNDS = 16;
 const LOGIN_RATE_LIMIT = 5;
 const LOGIN_RATE_WINDOW = 600;
@@ -52,6 +53,92 @@ function getSenderEmail(env) {
 
 function getSenderName(env) {
     return env?.SENDER_NAME || 'Ocean Hub';
+}
+
+function buildSessionCookie(token, maxAge = SESSION_TTL) {
+    return `session_token=${encodeURIComponent(token)}; HttpOnly; Secure; SameSite=Strict; Max-Age=${maxAge}; Path=/`;
+}
+
+function buildSessionResponseHeaders(sessionCookie, clearOAuth = false) {
+    const headers = new Headers({
+        'Content-Type': 'text/html; charset=utf-8',
+        'Cache-Control': 'no-store'
+    });
+    headers.append('Set-Cookie', sessionCookie);
+    if (clearOAuth) headers.append('Set-Cookie', clearOAuthStateCookie());
+    return headers;
+}
+
+function buildOAuthStateCookie(state) {
+    return `oauth_state=${encodeURIComponent(state)}; HttpOnly; Secure; SameSite=Lax; Max-Age=${OAUTH_STATE_TTL}; Path=/auth`;
+}
+
+function clearOAuthStateCookie() {
+    return 'oauth_state=; HttpOnly; Secure; SameSite=Lax; Max-Age=0; Path=/auth';
+}
+
+function getCookieValue(request, name) {
+    const cookie = request.headers.get('Cookie') || '';
+    const escapedName = name.replace(/[.*+?^${}()|[\\]\\]/g, '\\$&');
+    const match = cookie.match(new RegExp(`(?:^|;\\s*)${escapedName}=([^;]*)`));
+    if (!match) return null;
+    try { return decodeURIComponent(match[1]); } catch { return null; }
+}
+
+async function createOAuthState(env, provider) {
+    const state = generateRandomHex(32);
+    await env.STATS.put(
+        `oauth_state_${state}`,
+        JSON.stringify({ provider, createdAt: Date.now() }),
+        { expirationTtl: OAUTH_STATE_TTL }
+    );
+    return state;
+}
+
+async function consumeOAuthState(env, request, provider) {
+    const state = getCookieValue(request, 'oauth_state');
+    if (!state || !/^[a-f0-9]{64}$/i.test(state)) return false;
+    const raw = await env.STATS.get(`oauth_state_${state}`);
+    if (!raw) return false;
+    let data;
+    try { data = JSON.parse(raw); } catch { data = null; }
+    await env.STATS.delete(`oauth_state_${state}`);
+    return !!data && data.provider === provider && Date.now() - Number(data.createdAt || 0) <= OAUTH_STATE_TTL * 1000;
+}
+
+function getRequestDevice(request) {
+    const ua = String(request.headers.get('User-Agent') || 'Desconocido').trim();
+    return ua.length > 180 ? ua.slice(0, 180) + '…' : ua;
+}
+
+async function recordSuccessfulLogin(env, user, request, method) {
+    const ip = getClientIP(request);
+    const now = new Date();
+    user.last_login = now.toISOString();
+    await env.STATS.put(`user_${user.email}`, JSON.stringify(user));
+    await logUserAction(env, user.email, 'login', {
+        ip,
+        userAgent: getRequestDevice(request),
+        method
+    });
+
+    // El envío no bloquea el login si Brevo está caído/no configurado.
+    await sendEmail(
+        env,
+        user.email,
+        `🔐 Nuevo inicio de sesión en Ocean Hub`,
+        `<div style="font-family:Arial,sans-serif;max-width:620px;margin:auto;color:#102a43">
+            <h2>🌊 Inicio de sesión detectado</h2>
+            <p>Hola <strong>${escapeHTML(user.name || user.email)}</strong>, se inició una sesión en tu cuenta de Ocean Hub.</p>
+            <ul>
+                <li><strong>Fecha:</strong> ${escapeHTML(now.toLocaleString('es-DO', { timeZone: 'America/Santo_Domingo' }))}</li>
+                <li><strong>Método:</strong> ${escapeHTML(method)}</li>
+                <li><strong>IP:</strong> ${escapeHTML(ip)}</li>
+                <li><strong>Dispositivo:</strong> ${escapeHTML(getRequestDevice(request))}</li>
+            </ul>
+            <p>Si no reconoces este inicio de sesión, cambia tu contraseña y revisa la seguridad de tu cuenta.</p>
+        </div>`
+    );
 }
 
 const PRODUCTS = {
@@ -430,9 +517,6 @@ async function authenticateUser(env, email, password) {
     if (!user) return null;
     const valid = await verifyPassword(password, user.salt, user.passwordHash);
     if (!valid) return null;
-    user.last_login = new Date().toISOString();
-    await env.STATS.put(`user_${email}`, JSON.stringify(user));
-    await logUserAction(env, email, 'login', { ip: 'unknown', userAgent: '' });
     return user;
 }
 
@@ -1166,8 +1250,10 @@ async function sendEmail(env, to, subject, html) {
         console.error('BREVO_API_KEY no configurada. No se envía email a', to);
         return;
     }
+    const controller = new AbortController();
+    const timeout = setTimeout(() => controller.abort(), 10000);
     try {
-        await fetch('https://api.brevo.com/v3/smtp/email', {
+        const response = await fetch('https://api.brevo.com/v3/smtp/email', {
             method: 'POST',
             headers: {
                 'accept': 'application/json',
@@ -1179,10 +1265,17 @@ async function sendEmail(env, to, subject, html) {
                 to: [{ email: to }],
                 subject: subject,
                 htmlContent: html
-            })
+            }),
+            signal: controller.signal
         });
+        if (!response.ok) {
+            const errorBody = await response.text().catch(() => '');
+            console.error('Brevo email error:', response.status, errorBody.slice(0, 500));
+        }
     } catch (e) {
         console.error('Brevo email error:', e);
+    } finally {
+        clearTimeout(timeout);
     }
 }
 
@@ -2754,7 +2847,7 @@ async function handleRegister(env, request) {
     try {
         const user = await createUser(env, email, name, password, referralCode);
         const token = await createSession(env, user);
-        const cookie = `session_token=${token}; HttpOnly; Secure; SameSite=Strict; Max-Age=${SESSION_TTL}; Path=/`;
+        const cookie = buildSessionCookie(token);
         await logUserAction(env, email, 'register', { referralCode });
         return new Response(`
         <html><body style="background:#0a1a2b;color:white;display:flex;justify-content:center;align-items:center;height:100vh;flex-direction:column;font-family:monospace;">
@@ -2805,16 +2898,28 @@ async function handleLogin(env, request) {
         <html>
         <head><meta charset="UTF-8"><title>${t('login')} - Ocean Hub</title>
         <style>
-            body { background: #0a1a2b; color: #e0f0ff; font-family: 'Segoe UI', sans-serif; display: flex; justify-content: center; align-items: center; min-height: 100vh; flex-direction: column; padding: 20px; }
-            .card { background: rgba(255,255,255,0.06); border-radius: 30px; padding: 40px; max-width: 400px; width: 100%; border: 1px solid rgba(0,200,255,0.2); }
-            h2 { color: #00ccff; text-align: center; }
-            input { width: 100%; padding: 12px; border-radius: 10px; border: none; background: rgba(255,255,255,0.08); color: white; font-size: 1rem; margin: 8px 0; }
-            button { background: #00ccff; border: none; color: #0a1a2b; padding: 12px; border-radius: 40px; font-weight: bold; font-size: 1.2rem; cursor: pointer; width: 100%; transition: 0.3s; }
-            button:hover { background: #33ddff; }
-            .back { margin-top: 20px; color: #00ccff; text-decoration: none; }
-            .auth-options { display: flex; justify-content: center; gap: 15px; margin: 15px 0; }
-            .auth-options a { color: #88ddff; text-decoration: none; padding: 8px 16px; border-radius: 20px; background: rgba(255,255,255,0.05); }
-            .auth-options a:hover { background: rgba(255,255,255,0.1); }
+            * { box-sizing: border-box; }
+            body { background: radial-gradient(circle at 20% 20%, rgba(0,204,255,.16), transparent 35%), radial-gradient(circle at 80% 80%, rgba(77,93,255,.14), transparent 35%), #0a1a2b; color: #e0f0ff; font-family: 'Segoe UI', sans-serif; display: flex; justify-content: center; align-items: center; min-height: 100vh; flex-direction: column; padding: 20px; overflow:hidden; position:relative; }
+            body::before, body::after { content:''; position:fixed; width:280px; height:280px; border-radius:50%; filter:blur(70px); opacity:.28; pointer-events:none; animation: floatOrb 9s ease-in-out infinite alternate; background:#00ccff; }
+            body::before { top:-120px; left:-100px; }
+            body::after { right:-100px; bottom:-120px; background:#6c63ff; animation-delay:-4s; }
+            .card { position:relative; z-index:1; background:linear-gradient(145deg, rgba(255,255,255,.10), rgba(255,255,255,.035)); backdrop-filter:blur(22px); -webkit-backdrop-filter:blur(22px); border-radius:30px; padding:40px; max-width:430px; width:100%; border:1px solid rgba(0,200,255,.25); box-shadow:0 25px 80px rgba(0,0,0,.38), inset 0 1px 0 rgba(255,255,255,.08); animation: cardIn .75s cubic-bezier(.2,.8,.2,1) both; }
+            h2 { color: #00ccff; text-align: center; text-shadow:0 0 24px rgba(0,204,255,.45); animation:titlePulse 2.8s ease-in-out infinite; }
+            input { width: 100%; padding: 13px 14px; border-radius: 12px; border: 1px solid transparent; outline:none; background: rgba(255,255,255,0.08); color: white; font-size: 1rem; margin: 8px 0; transition:.25s ease; }
+            input:focus { border-color:#00ccff; box-shadow:0 0 0 4px rgba(0,204,255,.10), 0 0 24px rgba(0,204,255,.12); transform:translateY(-1px); }
+            button { background: linear-gradient(135deg,#00ccff,#4d8dff); border: none; color: #0a1a2b; padding: 12px; border-radius: 40px; font-weight: bold; font-size: 1.2rem; cursor: pointer; width: 100%; transition: 0.3s; box-shadow:0 10px 28px rgba(0,140,255,.22); }
+            button:hover { transform:translateY(-2px); box-shadow:0 14px 34px rgba(0,180,255,.30); }
+            button:active { transform:translateY(0) scale(.99); }
+            .back { margin-top: 20px; color: #00ccff; text-decoration: none; transition:.25s; }
+            .back:hover { transform:translateX(-3px); display:inline-block; }
+            .auth-options { display:grid; grid-template-columns:1fr 1fr; gap:12px; margin:18px 0; }
+            .auth-options a { display:flex; align-items:center; justify-content:center; gap:9px; color:#fff; text-decoration:none; padding:12px 14px; border-radius:14px; background:rgba(255,255,255,.055); border:1px solid rgba(255,255,255,.08); transition:.25s ease; }
+            .auth-options a:hover { background:rgba(255,255,255,.11); transform:translateY(-2px); border-color:rgba(0,204,255,.28); box-shadow:0 10px 25px rgba(0,0,0,.18); }
+            .oauth-icon { width:20px; height:20px; flex:0 0 20px; }
+            @keyframes cardIn { from{opacity:0;transform:translateY(30px) scale(.97)} to{opacity:1;transform:none} }
+            @keyframes floatOrb { from{transform:translate3d(0,0,0) scale(1)} to{transform:translate3d(35px,-25px,0) scale(1.12)} }
+            @keyframes titlePulse { 0%,100%{text-shadow:0 0 20px rgba(0,204,255,.35)} 50%{text-shadow:0 0 34px rgba(0,204,255,.70)} }
+            @media (max-width:520px) { .card{padding:28px 20px;border-radius:24px}.auth-options{grid-template-columns:1fr} }
             .forgot { text-align:center; margin-top:10px; }
             .forgot a { color:#88ddff; text-decoration:none; font-size:0.9rem; }
             .forgot a:hover { color:#00ccff; }
@@ -2824,8 +2929,14 @@ async function handleLogin(env, request) {
         <div class="card">
             <h2>🔐 ${t('login')}</h2>
             <div class="auth-options">
-                <a href="/auth/discord">🟣 Discord</a>
-                <a href="/auth/google">🔴 Google</a>
+                <a href="/auth/discord" aria-label="Continuar con Discord">
+                    <svg class="oauth-icon" viewBox="0 0 24 24" aria-hidden="true"><path fill="#5865F2" d="M19.54 5.02A18.1 18.1 0 0 0 15.1 3.65a.07.07 0 0 0-.07.03c-.2.36-.43.83-.59 1.2a16.3 16.3 0 0 0-4.88 0c-.16-.37-.4-.84-.6-1.2a.07.07 0 0 0-.07-.03 18.1 18.1 0 0 0-4.44 1.37.06.06 0 0 0-.03.03C1.6 9.1.83 13.08 1.22 17a.08.08 0 0 0 .03.05 18.2 18.2 0 0 0 5.47 2.74.07.07 0 0 0 .08-.03c.42-.57.8-1.16 1.13-1.79a.07.07 0 0 0-.04-.1 12 12 0 0 1-1.7-.81.07.07 0 0 1-.01-.12l.34-.26a.07.07 0 0 1 .07-.01c3.55 1.62 7.39 1.62 10.9 0a.07.07 0 0 1 .07.01l.34.26a.07.07 0 0 1-.01.12c-.54.32-1.1.59-1.7.81a.07.07 0 0 0-.04.1c.34.62.72 1.22 1.14 1.79a.07.07 0 0 0 .08.03 18.2 18.2 0 0 0 5.47-2.74.07.07 0 0 0 .03-.05c.46-4.54-.78-8.48-3.28-11.95a.06.06 0 0 0-.03-.03ZM8.2 14.67c-1.04 0-1.9-.96-1.9-2.14s.84-2.14 1.9-2.14c1.07 0 1.91.97 1.9 2.14 0 1.18-.84 2.14-1.9 2.14Zm7.6 0c-1.04 0-1.9-.96-1.9-2.14s.84-2.14 1.9-2.14c1.07 0 1.91.97 1.9 2.14 0 1.18-.84 2.14-1.9 2.14Z"/></svg>
+                    <span>Discord</span>
+                </a>
+                <a href="/auth/google" aria-label="Continuar con Google">
+                    <svg class="oauth-icon" viewBox="0 0 24 24" aria-hidden="true"><path fill="#4285F4" d="M21.35 12.2c0-.72-.06-1.42-.18-2.1H12v3.98h5.23a4.47 4.47 0 0 1-1.94 2.94v2.45h3.14c1.84-1.7 2.92-4.2 2.92-7.27Z"/><path fill="#34A853" d="M12 21.5c2.63 0 4.84-.87 6.45-2.36l-3.14-2.45c-.87.58-1.98.93-3.31.93-2.54 0-4.69-1.72-5.46-4.03H3.3v2.53A9.74 9.74 0 0 0 12 21.5Z"/><path fill="#FBBC05" d="M6.54 13.59A5.86 5.86 0 0 1 6.23 12c0-.55.1-1.09.31-1.59V7.88H3.3A9.75 9.75 0 0 0 2.25 12c0 1.57.38 3.05 1.05 4.12l3.24-2.53Z"/><path fill="#EA4335" d="M12 6.38c1.43 0 2.71.49 3.72 1.45l2.79-2.79C16.84 3.48 14.63 2.5 12 2.5a9.74 9.74 0 0 0-8.7 5.38l3.24 2.53C7.31 8.1 9.46 6.38 12 6.38Z"/></svg>
+                    <span>Google</span>
+                </a>
             </div>
             <hr style="border-color:rgba(255,255,255,0.1); margin: 15px 0;">
             <form method="POST" action="/login">
@@ -2899,8 +3010,9 @@ async function handleLogin(env, request) {
         `, { status: 200, headers: { 'Content-Type': 'text/html', 'Set-Cookie': cookie } });
     }
 
+    await recordSuccessfulLogin(env, user, request, 'Contraseña');
     const token = await createSession(env, user);
-    const cookie = `session_token=${token}; HttpOnly; Secure; SameSite=Strict; Max-Age=${SESSION_TTL}; Path=/`;
+    const cookie = buildSessionCookie(token);
     return new Response(`
     <html><body style="background:#0a1a2b;color:white;display:flex;justify-content:center;align-items:center;height:100vh;flex-direction:column;font-family:monospace;">
         <h2 style="color:#00cc88;">✅ Sesión iniciada</h2>
@@ -2937,9 +3049,10 @@ async function handleVerify2FA(env, request) {
     }
 
     await env.STATS.delete(`2fa_temp_${tempToken}`);
+    await recordSuccessfulLogin(env, user, request, 'Contraseña + 2FA');
     await logUserAction(env, email, 'login_2fa', { ip: getClientIP(request) });
     const sessionToken = await createSession(env, user);
-    const cookieSession = `session_token=${sessionToken}; HttpOnly; Secure; SameSite=Strict; Max-Age=${SESSION_TTL}; Path=/`;
+    const cookieSession = buildSessionCookie(sessionToken);
     return new Response(`
     <html><body style="background:#0a1a2b;color:white;display:flex;justify-content:center;align-items:center;height:100vh;flex-direction:column;font-family:monospace;">
         <h2 style="color:#00cc88;">✅ Verificación exitosa</h2>
@@ -6523,17 +6636,29 @@ async function handleUploadKeys(env, request) {
 
 async function handleDiscordAuth(env) {
     const clientId = env.DISCORD_CLIENT_ID;
-    if (!clientId) return new Response('Discord OAuth no configurado', { status: 400 });
+    if (!clientId) return new Response('Discord OAuth no configurado', { status: 503 });
+    const state = await createOAuthState(env, 'discord');
     const redirectUri = `${getBaseUrl(env)}/auth/discord/callback`;
-    const scope = 'identify email';
-    const authUrl = `https://discord.com/api/oauth2/authorize?client_id=${clientId}&redirect_uri=${encodeURIComponent(redirectUri)}&response_type=code&scope=${scope}`;
-    return Response.redirect(authUrl, 302);
+    const params = new URLSearchParams({
+        client_id: clientId,
+        redirect_uri: redirectUri,
+        response_type: 'code',
+        scope: 'identify email',
+        state
+    });
+    return new Response(null, {
+        status: 302,
+        headers: { 'Location': `https://discord.com/oauth2/authorize?${params}`, 'Set-Cookie': buildOAuthStateCookie(state), 'Cache-Control': 'no-store' }
+    });
 }
 
 async function handleDiscordCallback(env, request) {
     const url = new URL(request.url);
     const code = url.searchParams.get('code');
     if (!code) return new Response('Falta código', { status: 400 });
+    if (!(await consumeOAuthState(env, request, 'discord'))) {
+        return new Response('Solicitud OAuth inválida o expirada. Vuelve a intentarlo.', { status: 400 });
+    }
 
     const clientId = env.DISCORD_CLIENT_ID;
     const clientSecret = env.DISCORD_CLIENT_SECRET;
@@ -6550,10 +6675,11 @@ async function handleDiscordCallback(env, request) {
         })
     });
 
-    const tokenData = await tokenRes.json();
+    const tokenData = await tokenRes.json().catch(() => ({}));
 
-    if (!tokenData.access_token) {
-        return new Response(`Error al obtener token de Discord:<br><pre>${JSON.stringify(tokenData, null, 2)}</pre>`, {
+    if (!tokenRes.ok || !tokenData.access_token) {
+        console.error('Discord OAuth token exchange failed:', tokenRes.status, tokenData?.error);
+        return new Response('No se pudo completar el inicio de sesión con Discord.', {
             status: 400, headers: { 'Content-Type': 'text/html' }
         });
     }
@@ -6561,8 +6687,12 @@ async function handleDiscordCallback(env, request) {
     const userRes = await fetch('https://discord.com/api/users/@me', {
         headers: { 'Authorization': `Bearer ${tokenData.access_token}` }
     });
-    const userData = await userRes.json();
-    const email = userData.email;
+    const userData = await userRes.json().catch(() => ({}));
+    if (!userRes.ok) {
+        console.error('Discord userinfo failed:', userRes.status);
+        return new Response('No se pudo obtener la cuenta de Discord.', { status: 400 });
+    }
+    const email = String(userData.email || '').trim().toLowerCase();
     if (!email || userData.verified !== true) return new Response('El email de Discord debe estar verificado.', { status: 400 });
 
     let user = await getUserByEmail(env, email);
@@ -6571,35 +6701,49 @@ async function handleDiscordCallback(env, request) {
         try {
             user = await createUser(env, email, userData.username || email.split('@')[0], randomPass, null);
         } catch (e) {
-            return new Response('Error al crear usuario: ' + e.message, { status: 500 });
+            console.error('OAuth user creation failed:', e); return new Response('No se pudo crear la cuenta.', { status: 500 });
         }
     }
 
-    await logUserAction(env, email, 'login', { ip: getClientIP(request), method: 'discord' });
+    await recordSuccessfulLogin(env, user, request, 'Discord');
     const sessionToken = await createSession(env, user);
-    const cookie = `session_token=${sessionToken}; HttpOnly; Secure; SameSite=Strict; Max-Age=${SESSION_TTL}; Path=/`;
+    const cookie = buildSessionCookie(sessionToken);
     return new Response(`
     <html><body style="background:#0a1a2b;color:white;display:flex;justify-content:center;align-items:center;height:100vh;flex-direction:column;font-family:monospace;">
         <h2 style="color:#00cc88;">✅ Sesión iniciada con Discord</h2>
         <p>Bienvenido, ${escapeHTML(user.name || user.email)}.</p>
         <a href="/profile" style="color:#00ccff;">Ir a mi perfil</a>
     </body></html>
-    `, { status: 200, headers: { 'Content-Type': 'text/html', 'Set-Cookie': cookie } });
+    `, { status: 200, headers: buildSessionResponseHeaders(cookie, true) });
 }
 
 async function handleGoogleAuth(env) {
     const clientId = env.GOOGLE_CLIENT_ID;
-    if (!clientId) return new Response('Google OAuth no configurado', { status: 400 });
+    if (!clientId) return new Response('Google OAuth no configurado', { status: 503 });
+    const state = await createOAuthState(env, 'google');
     const redirectUri = `${getBaseUrl(env)}/auth/google/callback`;
-    const scope = 'email profile';
-    const authUrl = `https://accounts.google.com/o/oauth2/auth?client_id=${clientId}&redirect_uri=${encodeURIComponent(redirectUri)}&response_type=code&scope=${scope}&access_type=online`;
-    return Response.redirect(authUrl, 302);
+    const params = new URLSearchParams({
+        client_id: clientId,
+        redirect_uri: redirectUri,
+        response_type: 'code',
+        scope: 'openid email profile',
+        state,
+        access_type: 'online',
+        prompt: 'select_account'
+    });
+    return new Response(null, {
+        status: 302,
+        headers: { 'Location': `https://accounts.google.com/o/oauth2/v2/auth?${params}`, 'Set-Cookie': buildOAuthStateCookie(state), 'Cache-Control': 'no-store' }
+    });
 }
 
 async function handleGoogleCallback(env, request) {
     const url = new URL(request.url);
     const code = url.searchParams.get('code');
     if (!code) return new Response('Falta código', { status: 400 });
+    if (!(await consumeOAuthState(env, request, 'google'))) {
+        return new Response('Solicitud OAuth inválida o expirada. Vuelve a intentarlo.', { status: 400 });
+    }
 
     const clientId = env.GOOGLE_CLIENT_ID;
     const clientSecret = env.GOOGLE_CLIENT_SECRET;
@@ -6616,10 +6760,11 @@ async function handleGoogleCallback(env, request) {
         })
     });
 
-    const tokenData = await tokenRes.json();
+    const tokenData = await tokenRes.json().catch(() => ({}));
 
-    if (!tokenData.access_token) {
-        return new Response(`Error al obtener token de Google:<br><pre>${JSON.stringify(tokenData, null, 2)}</pre>`, {
+    if (!tokenRes.ok || !tokenData.access_token) {
+        console.error('Google OAuth token exchange failed:', tokenRes.status, tokenData?.error);
+        return new Response('No se pudo completar el inicio de sesión con Google.', {
             status: 400, headers: { 'Content-Type': 'text/html' }
         });
     }
@@ -6627,8 +6772,12 @@ async function handleGoogleCallback(env, request) {
     const userRes = await fetch('https://www.googleapis.com/oauth2/v2/userinfo', {
         headers: { 'Authorization': `Bearer ${tokenData.access_token}` }
     });
-    const userData = await userRes.json();
-    const email = userData.email;
+    const userData = await userRes.json().catch(() => ({}));
+    if (!userRes.ok) {
+        console.error('Google userinfo failed:', userRes.status);
+        return new Response('No se pudo obtener la cuenta de Google.', { status: 400 });
+    }
+    const email = String(userData.email || '').trim().toLowerCase();
     if (!email || userData.verified_email !== true) return new Response('El email de Google debe estar verificado.', { status: 400 });
 
     let user = await getUserByEmail(env, email);
@@ -6637,20 +6786,20 @@ async function handleGoogleCallback(env, request) {
         try {
             user = await createUser(env, email, userData.name || email.split('@')[0], randomPass, null);
         } catch (e) {
-            return new Response('Error al crear usuario: ' + e.message, { status: 500 });
+            console.error('OAuth user creation failed:', e); return new Response('No se pudo crear la cuenta.', { status: 500 });
         }
     }
 
-    await logUserAction(env, email, 'login', { ip: getClientIP(request), method: 'google' });
+    await recordSuccessfulLogin(env, user, request, 'Google');
     const sessionToken = await createSession(env, user);
-    const cookie = `session_token=${sessionToken}; HttpOnly; Secure; SameSite=Strict; Max-Age=${SESSION_TTL}; Path=/`;
+    const cookie = buildSessionCookie(sessionToken);
     return new Response(`
     <html><body style="background:#0a1a2b;color:white;display:flex;justify-content:center;align-items:center;height:100vh;flex-direction:column;font-family:monospace;">
         <h2 style="color:#00cc88;">✅ Sesión iniciada con Google</h2>
         <p>Bienvenido, ${escapeHTML(user.name || user.email)}.</p>
         <a href="/profile" style="color:#00ccff;">Ir a mi perfil</a>
     </body></html>
-    `, { status: 200, headers: { 'Content-Type': 'text/html', 'Set-Cookie': cookie } });
+    `, { status: 200, headers: buildSessionResponseHeaders(cookie, true) });
 }
 
 async function handleReview(env, request) {
@@ -6910,6 +7059,20 @@ async function handleWelcome(env, request) {
         text-shadow: 0 0 25px #00ccff, 0 0 55px #0088ff;
         margin-bottom: 8px;
         letter-spacing: 1px;
+        animation: oceanGlow 3s ease-in-out infinite;
+    }
+    #welcomeContent .subtitle { animation: fadeUp .8s .15s both; }
+    .terms-box { animation: fadeUp .8s .25s both; }
+    .checkbox-container { animation: fadeUp .8s .35s both; }
+    .buttons .btn { animation: buttonFloat .8s .45s both; }
+    .buttons .btn:nth-child(2) { animation-delay:.55s; }
+    @keyframes oceanGlow {
+        0%,100% { transform:translateY(0); filter:drop-shadow(0 0 0 rgba(0,204,255,0)); }
+        50% { transform:translateY(-4px); filter:drop-shadow(0 0 18px rgba(0,204,255,.35)); }
+    }
+    @keyframes buttonFloat {
+        from { opacity:0; transform:translateY(18px) scale(.97); }
+        to { opacity:1; transform:translateY(0) scale(1); }
     }
     #welcomeContent .subtitle {
         color: #88ddff;
