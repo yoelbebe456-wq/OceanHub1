@@ -747,7 +747,7 @@ async function initStaticKeys(env) {
 // ==================================================
 const LOCAL_KV_LOCKS = new Map();
 
-async function withKVLock(env, name, fn) {
+async function withKVLock(env, name, fn, ttlMs = 60000) {
     // Las mutaciones protegidas por este helper requieren un Durable Object.
     // Un lock en memoria NO es seguro entre isolates/instancias de Cloudflare,
     // así que fallamos cerrado si KV_LOCKER no está configurado.
@@ -763,7 +763,7 @@ async function withKVLock(env, name, fn) {
         acquire = await stub.fetch('https://kv-lock/acquire', {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({ token: lockToken, ttl: 60000 })
+            body: JSON.stringify({ token: lockToken, ttl: ttlMs })
         });
         if (acquire.ok) break;
         await new Promise(resolve => setTimeout(resolve, Math.min(100 + attempt * 50, 500)));
@@ -1136,7 +1136,7 @@ function adminProtectedPath(path) {
     return path === '/admin' || path.startsWith('/admin/') ||
         ['/admin-action','/generate','/generate-batch','/export-csv','/export-json',
          '/qr-totp','/renew-key','/search-key','/verify-batch','/webhook',
-         '/webhook/test','/shorten','/key-info'].includes(path);
+         '/webhook/test','/shorten','/key-info','/cron-renew','/cron-jobs'].includes(path);
 }
 
 // ==================================================
@@ -1328,11 +1328,29 @@ async function useCoupon(env, code) {
 // ==================================================
 // [ WEBHOOKS PERSONALIZADOS ]
 // ==================================================
+function isSafeWebhookUrl(value) {
+    try {
+        const url = new URL(String(value || ''));
+        const host = url.hostname.toLowerCase().replace(/^\[|\]$/g, '');
+        if (url.protocol !== 'https:' || url.username || url.password) return false;
+        if (url.port && url.port !== '443') return false;
+        if (!host || host === 'localhost' || host.endsWith('.localhost') ||
+            host.endsWith('.local') || host.endsWith('.internal') || host.endsWith('.lan') ||
+            host.endsWith('.test') || host.endsWith('.invalid')) return false;
+        // Only DNS hostnames are accepted; literal IPv4/IPv6 addresses are rejected.
+        if (host.includes(':') || /^[0-9.]+$/.test(host)) return false;
+        return host.includes('.') && !host.startsWith('.') && !host.endsWith('.');
+    } catch {
+        return false;
+    }
+}
+
 async function triggerWebhooks(env, email, event, data) {
     const webhook = await env.STATS.get(`webhook_${email}`, 'json');
-    if (!webhook || !webhook.url) return;
+    if (!webhook || !isSafeWebhookUrl(webhook.url)) return;
     await fetch(webhook.url, {
         method: 'POST',
+        redirect: 'manual',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ event, data, timestamp: new Date().toISOString() })
     }).catch(e => console.error('Webhook error:', e));
@@ -2724,7 +2742,10 @@ async function handleAdminIngresos(env, url) {
     });
 }
 
-async function handleCronRenew(env) {
+async function handleCronRenew(env, request) {
+    if (!request || request.method !== 'POST') return jsonResponse({ error: 'Método no permitido' }, 405);
+    const auth = await requireAdmin(env, request);
+    if (!auth) return jsonResponse({ error: 'No autorizado' }, 403);
     const userList = await env.STATS.get('user_list', 'json') || [];
     let renovadas = 0;
     let alertadas = 0;
@@ -3248,11 +3269,14 @@ async function handleProfile(env, request) {
             }
 
             function renovarSuscripcion() {
-                if (!confirm('¿Renovar suscripción +30 días?')) return;
+                if (!confirm('¿Continuar a PayPal para pagar la renovación de tu suscripción?')) return;
                 postJSON('/renovar-suscripcion').then(function(data) {
-                    alert(data.message || data.error || 'Listo');
-                    location.reload();
-                }).catch(function(err) { alert('Error: ' + err.message); });
+                    var approval = Array.isArray(data.links) && data.links.find(function(link) {
+                        return link && link.rel === 'approve' && /^https:\/\//i.test(link.href || '');
+                    });
+                    if (!approval) throw new Error('PayPal no devolvió el enlace de aprobación. Inténtalo más tarde.');
+                    location.href = approval.href;
+                }).catch(function(err) { alert('No se pudo iniciar el pago: ' + err.message); });
             }
 
             function activar2FA() {
@@ -3460,7 +3484,12 @@ async function createPayPalOrder(env, priceId, metadata = {}, couponCode = null)
             },
         }),
     });
-    return await response.json();
+    const data = await response.json().catch(() => ({}));
+    if (!response.ok || !data.id) {
+        console.error('PayPal order creation failed:', response.status, data?.name || data?.message || 'unknown error');
+        throw new Error('No se pudo crear la orden de PayPal');
+    }
+    return data;
 }
 
 async function createPayPalOrderSuscripcion(env, plan, email, couponCode = null) {
@@ -3497,19 +3526,41 @@ async function createPayPalOrderSuscripcion(env, plan, email, couponCode = null)
             },
         }),
     });
-    return await response.json();
+    const data = await response.json().catch(() => ({}));
+    if (!response.ok || !data.id) {
+        console.error('PayPal order creation failed:', response.status, data?.name || data?.message || 'unknown error');
+        throw new Error('No se pudo crear la orden de PayPal');
+    }
+    return data;
 }
 
 async function capturePayPalOrder(env, orderId) {
     const accessToken = await getPayPalAccessToken(env);
-    const response = await fetch(`${getPayPalApiUrl(env)}/v2/checkout/orders/${orderId}/capture`, {
+    const response = await fetch(`${getPayPalApiUrl(env)}/v2/checkout/orders/${encodeURIComponent(orderId)}/capture`, {
         method: 'POST',
         headers: {
             'Authorization': `Bearer ${accessToken}`,
             'Content-Type': 'application/json',
         },
     });
-    return await response.json();
+    const data = await response.json().catch(() => ({}));
+    if (!response.ok) {
+        const error = new Error(`PayPal capture failed with HTTP ${response.status}`);
+        error.status = response.status;
+        throw error;
+    }
+    return data;
+}
+
+async function getPayPalOrderData(env, orderId) {
+    const accessToken = await getPayPalAccessToken(env);
+    const response = await fetch(`${getPayPalApiUrl(env)}/v2/checkout/orders/${encodeURIComponent(orderId)}`, {
+        method: 'GET',
+        headers: { 'Authorization': `Bearer ${accessToken}`, 'Content-Type': 'application/json' },
+    });
+    const data = await response.json().catch(() => ({}));
+    if (!response.ok) throw new Error(`PayPal order lookup failed with HTTP ${response.status}`);
+    return data;
 }
 
 // ==================================================
@@ -5354,7 +5405,24 @@ async function handleKey() {
 // ==================================================
 // [ PAYPAL CAPTURE ]
 // ==================================================
-async function handlePayPalCapture(env, request) {
+async function handlePayPalCapture(env, request, preCapturedData = null) {
+    const url = new URL(request.url);
+    const orderId = url.searchParams.get('token') || url.searchParams.get('orderId');
+    if (!orderId) return new Response('Falta el ID de la orden', { status: 400 });
+    try {
+        // Serialize browser-return and webhook fulfillment for the same PayPal order.
+        return await withKVLock(env, `paypal_payment_${orderId}`, () =>
+            handlePayPalCaptureUnlocked(env, request, preCapturedData), 110000);
+    } catch (error) {
+        console.error('Could not lock PayPal payment processing:', error?.message || error);
+        return new Response('El pago se está procesando. Espera unos segundos y vuelve a consultar tu perfil.', {
+            status: 503,
+            headers: { 'Content-Type': 'text/plain; charset=utf-8', 'Retry-After': '10', 'Cache-Control': 'no-store' }
+        });
+    }
+}
+
+async function handlePayPalCaptureUnlocked(env, request, preCapturedData = null) {
     const url = new URL(request.url);
     const orderId = url.searchParams.get('token') || url.searchParams.get('orderId');
     if (!orderId) {
@@ -5362,11 +5430,10 @@ async function handlePayPalCapture(env, request) {
     }
 
     try {
-        const captureData = await capturePayPalOrder(env, orderId);
+        const captureData = preCapturedData || await capturePayPalOrder(env, orderId);
         if (captureData?.status !== 'COMPLETED') return new Response('Pago no completado', { status: 402 });
         const paymentKey = `paypal_processed_${orderId}`;
         if (await env.STATS.get(paymentKey)) return new Response('Pago ya procesado', { status: 200 });
-        await env.STATS.put(paymentKey, '1', { expirationTtl: 31536000 });
         let customData = {};
         try {
             const customId = captureData.purchase_units?.[0]?.custom_id || '{}';
@@ -5407,6 +5474,8 @@ async function handlePayPalCapture(env, request) {
                 clave: 'Suscripción', producto: `Suscripción ${planData.name}`,
                 precio: Number(subscriptionPrice.toFixed(2)), payment_id: orderId, proveedor: 'paypal', estado: 'activa'
             });
+            // Record completion only after the subscription and purchase record exist.
+            await env.STATS.put(paymentKey, '1', { expirationTtl: 31536000 });
             await sendAlert(env, `✅ Suscripción activada: ${email} -> ${planData.name} (${planData.days} días)`, 'suscripcion');
             await triggerWebhooks(env, email, 'subscription_activated', { plan: planData.name, days: planData.days });
             await logUserAction(env, email, 'subscription_purchase', { plan: planData.name, orderId });
@@ -5453,6 +5522,8 @@ async function handlePayPalCapture(env, request) {
                 producto: product.name, precio: price,
                 payment_id: orderId, proveedor: 'paypal', estado: 'activa'
             });
+            // Record completion after the key has been stored and the purchase is registered.
+            await env.STATS.put(paymentKey, '1', { expirationTtl: 31536000 });
 
             const user = await getUserByEmail(env, email);
             if (user && user.referido_por) {
@@ -5519,7 +5590,7 @@ async function handlePayPalCapture(env, request) {
         return new Response(`
         <html><body style="background:#0a1a2b;color:white;display:flex;justify-content:center;align-items:center;height:100vh;flex-direction:column;font-family:monospace;">
             <h2 style="color:#ff6666;">❌ Error al procesar el pago</h2>
-            <p>${e.message}</p>
+            <p>No pudimos completar la entrega de tu compra. Conserva el ID de la orden y contacta con soporte.</p>
             <a href="/shop" style="color:#00ccff;">Volver a la tienda</a>
         </body></html>
         `, { status: 500, headers: { 'Content-Type': 'text/html' } });
@@ -6838,10 +6909,14 @@ async function handleGetReviews(env, url) {
 async function handleRegisterWebhook(env, request) {
     const auth = await requireAuth(env, request);
     if (!auth) return jsonResponse({ error: 'No autorizado' }, 403);
-    const body = await request.json();
-    const { url } = body;
+    let body;
+    try { body = await request.json(); } catch { return jsonResponse({ error: 'JSON inválido' }, 400); }
+    const { url } = body || {};
     if (!url) return jsonResponse({ error: 'Falta URL' }, 400);
-    await env.STATS.put(`webhook_${auth.user.email}`, JSON.stringify({ url, created: new Date().toISOString() }));
+    if (typeof url !== 'string' || url.length > 2048 || !isSafeWebhookUrl(url)) {
+        return jsonResponse({ error: 'La URL debe ser HTTPS pública, sin credenciales ni puertos no estándar.' }, 400);
+    }
+    await env.STATS.put(`webhook_${auth.user.email}`, JSON.stringify({ url: new URL(url).href, created: new Date().toISOString() }));
     return jsonResponse({ message: 'Webhook registrado' });
 }
 
@@ -6917,9 +6992,24 @@ async function handlePayPalWebhook(env, request) {
     const vd = await vr.json();
     if (!vr.ok || vd.verification_status !== 'SUCCESS') return jsonResponse({error:'Firma no válida'},403);
     if (body.event_type === 'PAYMENT.CAPTURE.COMPLETED') {
-        const orderId = body.resource?.supplementary_data?.related_ids?.order_id || body.resource?.id;
-        if (!orderId) return jsonResponse({error:'orderId ausente'},400);
-        return await handlePayPalCapture(env,new Request(`${getBaseUrl(env)}/paypal/capture?orderId=${encodeURIComponent(orderId)}`));
+        const orderId = body.resource?.supplementary_data?.related_ids?.order_id;
+        if (!orderId) return jsonResponse({ error: 'orderId ausente en el evento de PayPal' }, 400);
+        try {
+            // The webhook describes an already-completed capture. Fetch the order details;
+            // do not attempt to capture the same order a second time.
+            const orderData = await getPayPalOrderData(env, orderId);
+            if (orderData?.status !== 'COMPLETED') {
+                return jsonResponse({ error: 'La orden todavía no está completada' }, 409);
+            }
+            return await handlePayPalCapture(
+                env,
+                new Request(`${getBaseUrl(env)}/paypal/capture?orderId=${encodeURIComponent(orderId)}`),
+                orderData
+            );
+        } catch (error) {
+            console.error('PayPal webhook fulfillment failed:', error?.message || error);
+            return jsonResponse({ error: 'No se pudo procesar el evento de PayPal' }, 502);
+        }
     }
     return jsonResponse({status:'ok'});
 }
@@ -7381,24 +7471,34 @@ async function handleSubscribe(env, request) {
 }
 
 async function handlePaySubscription(env, request) {
+    const auth = await requireAuth(env, request);
+    if (!auth) return jsonResponse({ error: 'No autorizado' }, 403);
     const url = new URL(request.url);
     const plan = url.searchParams.get('plan');
-    const email = url.searchParams.get('email');
-    if (!plan || !email) {
-        return jsonResponse({ error: 'Faltan parámetros (plan y email)' }, 400);
-    }
+    if (!plan) return jsonResponse({ error: 'Falta el plan' }, 400);
+    // Never trust a client-supplied email for payment entitlement assignment.
     try {
-        const order = await createPayPalOrderSuscripcion(env, plan, email);
+        const order = await createPayPalOrderSuscripcion(env, plan, auth.user.email);
         return jsonResponse(order);
     } catch (e) {
-        return jsonResponse({ error: 'No se pudo crear la orden de pago' }, 500);
+        console.error('Subscription checkout creation failed:', e?.message || e);
+        return jsonResponse({ error: 'No se pudo crear la orden de pago' }, 502);
     }
 }
 
-async function handleCronJobs(env) {
+async function handleCronJobs(env, request) {
+    if (!request || request.method !== 'POST') return jsonResponse({ error: 'Método no permitido' }, 405);
+    const auth = await requireAdmin(env, request);
+    if (!auth) return jsonResponse({ error: 'No autorizado' }, 403);
     await updateLeaderboard(env);
+    if (!env.R2) {
+        return jsonResponse({
+            error: 'Ranking actualizado, pero el backup no se guardó: falta configurar el binding R2.',
+            code: 'R2_NOT_CONFIGURED'
+        }, 503);
+    }
     await backupKV(env);
-    return jsonResponse({ message: 'Cron jobs ejecutados' });
+    return jsonResponse({ message: 'Ranking actualizado y backup guardado' });
 }
 
 // ==================================================
@@ -8336,8 +8436,11 @@ export async function workerFetch(request, env) {
         if (path === '/qr-totp') return await handleQR(env, url);
         if (path === '/sse') return await handleSSE(env);
         if (path === '/shop/create-checkout') {
+            const checkoutAuth = await requireAuth(env, request);
+            if (!checkoutAuth) return jsonResponse({ error: 'No autorizado' }, 403);
             const tipo = url.searchParams.get('tipo') || 'dlc';
-            const email = url.searchParams.get('email') || '';
+            // The authenticated account owns the purchase; ignore any email supplied by the client.
+            const email = checkoutAuth.user.email;
             const coupon = url.searchParams.get('coupon') || null;
             if (tipo === 'suscripcion') {
                 const plan = url.searchParams.get('plan');
@@ -8388,10 +8491,25 @@ export async function workerFetch(request, env) {
         if (path === '/suscribirse') return await handleSubscribe(env, request);
         if (path === '/pay-subscription') return await handlePaySubscription(env, request);
         if (path === '/renovar-suscripcion') {
+            if (request.method !== 'POST') return jsonResponse({ error: 'Método no permitido' }, 405);
             const auth = await requireAuth(env, request);
             if (!auth) return jsonResponse({ error: 'No autorizado' }, 403);
-            await renovarSuscripcion(env, auth.user.email, 30);
-            return jsonResponse({ message: 'Suscripción renovada +30 días' });
+            const subscription = await getSuscripcionUsuario(env, auth.user.email);
+            if (!subscription || !SUSCRIPCION_PLANES[subscription.plan]) {
+                return jsonResponse({ error: 'No se encontró una suscripción válida para renovar.' }, 400);
+            }
+            try {
+                // A renewal must be paid through PayPal; never extend a subscription for free.
+                const order = await createPayPalOrderSuscripcion(env, subscription.plan, auth.user.email);
+                if (!order || !order.id || !Array.isArray(order.links)) {
+                    console.error('PayPal did not return a valid renewal order:', order?.name || order?.message || 'unknown error');
+                    return jsonResponse({ error: 'PayPal no pudo crear la orden de renovación.' }, 502);
+                }
+                return jsonResponse(order);
+            } catch (error) {
+                console.error('Could not create subscription renewal order:', error?.message || error);
+                return jsonResponse({ error: 'No se pudo iniciar el pago de renovación.' }, 502);
+            }
         }
         if (path === '/cancelar-renovacion') {
             const auth = await requireAuth(env, request);
@@ -8421,7 +8539,7 @@ export async function workerFetch(request, env) {
         if (path === '/admin/batch-expire') return await handleBatchExpire(env, request);
         if (path === '/admin/console') return await handleAdminConsole(env, request);
         if (path === '/admin/ingresos') return await handleAdminIngresos(env, url);
-        if (path === '/cron-renew') return await handleCronRenew(env);
+        if (path === '/cron-renew') return await handleCronRenew(env, request);
         if (path === '/admin/generar-prueba') return await handleGenerarPrueba(env, request);
         if (path.startsWith('/s/')) return await handleShortRedirect(env, url);
 
@@ -8449,7 +8567,7 @@ export async function workerFetch(request, env) {
         if (path === '/canjear-puntos') return await handleRedeemPoints(env, request);
         if (path === '/leaderboard') return await handleLeaderboard(env);
         if (path === '/toggle-dark-mode') return await handleToggleDarkMode(env, request);
-        if (path === '/cron-jobs') return await handleCronJobs(env);
+        if (path === '/cron-jobs') return await handleCronJobs(env, request);
 
         // --- Social ---
         if (path.startsWith('/Profile/') || path.startsWith('/profile/') || path.startsWith('/u/')) {
