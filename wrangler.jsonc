@@ -1,3 +1,4 @@
+
 {
   "$schema": "./node_modules/wrangler/config-schema.json",
   "name": "oceanhud",
@@ -31,10 +32,10 @@
     ]
   },
 
-  "migrations": [
-    {
-      "tag": "v1",
-      "new_sqlite_classes": ["KVLocker"]
+  "exports": {
+    "KVLocker": {
+      "type": "durable-object",
+      "storage": "sqlite"
     }
-  ]
+  }
 }
