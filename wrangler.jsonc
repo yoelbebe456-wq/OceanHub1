@@ -1,11 +1,14 @@
 {
   "$schema": "./node_modules/wrangler/config-schema.json",
   "name": "oceanhud",
-  "main": "OceanHub_SECURITY_PATCHED_FINAL_v11.js",
+  "main": "OceanHub_SECURITY_PATCHED_FINAL_v12.js",
   "compatibility_date": "2026-09-27",
 
   "vars": {
     "BASE_URL": "https://oceanhud.yoelenmanuelzorrilla.workers.dev",
+    "PAYPAL_MODE": "live",
+    "ADMIN_REQUIRE_2FA": "true",
+    "SENDER_NAME": "Ocean Hub",
     "GEMINI_MODEL": "gemini-2.5-flash",
     "OPENROUTER_MODEL": "openrouter/free",
     "GEMINI_IMAGE_MODEL": "gemini-2.0-flash-preview-image-generation",
