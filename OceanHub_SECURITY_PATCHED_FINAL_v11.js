@@ -8549,7 +8549,7 @@ export async function workerFetch(request, env) {
         if (path === '/admin/backup') return await handleBackup(env, request);
         if (path === '/admin/upload-keys') return await handleUploadKeys(env, request);
 
-        if (path === '/google53213708c5fda63c.html') return new Response('google-site-verification: google53213708c5fda63c.html', { headers: { 'Content-Type': 'text/html' } });
+        if (path === '/google-site-verification=-fN3u75bTpGxDsM2DbBivq0SJ2fuREK-QsMsbvJGnHI') return new Response('google-site-verification=-fN3u75bTpGxDsM2DbBivq0SJ2fuREK-QsMsbvJGnHI', { headers: { 'Content-Type': 'text/html' } });
 
         // --- OAuth ---
         if (path === '/auth/discord') return await handleDiscordAuth(env);
